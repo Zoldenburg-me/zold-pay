@@ -13,13 +13,29 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  attachTransfer,
+  createIntent,
+  exchangeCode,
+  isIntentExpired,
+  redirectAllowed,
+  seedDemoMerchant,
+  statusByToken,
+  statusView,
+  type CoreTransfer,
+} from "./checkout.js";
 import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled } from "./config.js";
 import { core, type CoreError } from "./core.js";
 import { proxy } from "./proxy.js";
+import { initStore, store } from "./store.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
 
 assertConfigSane();
+initStore();
+// Seed a demo merchant only where the demo shortcuts are on, so the flow is
+// exercisable without a real partner. A hosted deploy gets no default client.
+if (devShortcutsEnabled()) seedDemoMerchant(process.env.CHECKOUT_DEMO_IBAN);
 
 export const app = express();
 app.disable("x-powered-by");
@@ -125,6 +141,129 @@ app.post(
       );
     } catch (err) {
       relayCoreError(err, res);
+    }
+  }),
+);
+
+// --- "Pay with Zold" checkout (the merchant OAuth handoff) -------------------
+// This service is the authorization server. These routes were in the core app
+// until PR #68 extracted the checkout product here; the core no longer serves
+// /api/checkout/* at all. They are declared before the proxy so they are
+// answered locally rather than forwarded.
+
+// Merchant handoff: validate the client + redirect_uri, create a payment
+// intent, and send the user to the checkout UI. Returns JSON to API callers
+// (tests, merchant backends), redirects a browser.
+app.get(
+  "/api/checkout/authorize",
+  wrap(async (req, res) => {
+    const q = req.query as Record<string, string>;
+    const merchant = q.client_id ? store.findMerchantByClientId(q.client_id) : undefined;
+    if (!merchant) return res.status(400).json({ error: "unknown client_id" });
+    if (!q.redirect_uri || !redirectAllowed(merchant, q.redirect_uri)) {
+      return res.status(400).json({ error: "redirect_uri not allowed for this client" });
+    }
+    const amountEur = Number(q.amount);
+    if (!(amountEur > 0)) return res.status(400).json({ error: "positive amount required" });
+    if (!q.code_challenge || (q.code_challenge_method ?? "S256") !== "S256") {
+      return res.status(400).json({ error: "S256 code_challenge required" });
+    }
+    const intent = createIntent(merchant, {
+      amountEur,
+      reference: q.reference ?? "",
+      redirectUri: q.redirect_uri,
+      state: q.state ?? "",
+      codeChallenge: q.code_challenge,
+    });
+    // Absolute, unlike the core's old relative URL: the merchant redirects the
+    // user here from its own origin, so a path alone would resolve against the
+    // wrong host.
+    const checkoutUrl = `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`;
+    if ((req.header("accept") ?? "").includes("application/json")) {
+      return res.status(201).json({ intentId: intent.id, checkoutUrl, merchant: merchant.name, amountEur });
+    }
+    res.redirect(checkoutUrl);
+  }),
+);
+
+// Public-facing intent info for the checkout UI (no secrets): who is being
+// paid and how much. No auth — it's a redirect target the user just landed on.
+app.get(
+  "/api/checkout/intents/:id",
+  wrap(async (req, res) => {
+    const intent = store.findPaymentIntent(req.params.id);
+    if (!intent) return res.status(404).json({ error: "unknown checkout" });
+    const merchant = store.findMerchant(intent.merchantId);
+    res.json({
+      ...statusView(intent),
+      merchant: merchant?.name,
+      merchantIban: merchant?.ibanTarget,
+      expired: isIntentExpired(intent),
+    });
+  }),
+);
+
+// The user links the transfer they just authorized into the merchant's IBAN,
+// minting the one-time code and the redirect back.
+//
+// The core app could read the transfer from its own store and check the
+// session against it. We read it back from the core API with the caller's own
+// bearer instead — which is the same proof: a transfer another user owns is
+// not readable with this session, so a 403/404 upstream is the answer.
+app.post(
+  "/api/checkout/intents/:id/attach",
+  wrap(async (req, res) => {
+    const intent = store.findPaymentIntent(req.params.id);
+    if (!intent) return res.status(404).json({ error: "unknown checkout" });
+    const token = bearer(req);
+    if (!token) return res.status(401).json({ error: "authorization required" });
+    const transferId = req.body?.transferId;
+    if (typeof transferId !== "string" || !transferId) {
+      return res.status(400).json({ error: "transferId required" });
+    }
+    let transfer: CoreTransfer;
+    try {
+      transfer = await core<CoreTransfer>(`/api/transfers/${encodeURIComponent(transferId)}`, {
+        sessionToken: token,
+      });
+    } catch (err) {
+      return relayCoreError(err, res);
+    }
+    try {
+      res.json(attachTransfer(intent, transfer.userId, transfer));
+    } catch (e: any) {
+      res.status(400).json({ error: String(e?.message ?? e) });
+    }
+  }),
+);
+
+// Merchant confidential token exchange: code + PKCE verifier + client secret
+// → status + a bearer for polling. Burns the code.
+app.post(
+  "/api/checkout/token",
+  wrap(async (req, res) => {
+    const { client_id, client_secret, code, code_verifier } = req.body ?? {};
+    if (!client_id || !client_secret || !code || !code_verifier) {
+      return res.status(400).json({ error: "client_id, client_secret, code and code_verifier required" });
+    }
+    try {
+      res.json(exchangeCode(client_id, client_secret, code, code_verifier));
+    } catch (e: any) {
+      res.status(400).json({ error: String(e?.message ?? e) });
+    }
+  }),
+);
+
+// Merchant status polling with the exchange bearer.
+app.get(
+  "/api/checkout/status/:id",
+  wrap(async (req, res) => {
+    const tok = bearer(req);
+    if (!tok) return res.status(401).json({ error: "authorization required" });
+    try {
+      res.json(statusByToken(req.params.id, tok));
+    } catch (e: any) {
+      res.status(404).json({ error: String(e?.message ?? e) });
     }
   }),
 );

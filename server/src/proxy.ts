@@ -24,10 +24,6 @@ interface Rule {
 const ALLOW: Rule[] = [
   { method: "GET", pattern: "/api/health" },
 
-  // Intent display + the attach that mints the merchant's redirect code.
-  { method: "GET", pattern: "/api/checkout/intents/:id" },
-  { method: "POST", pattern: "/api/checkout/intents/:id/attach" },
-
   // Account creation and read-back.
   { method: "POST", pattern: "/api/users" },
   { method: "GET", pattern: "/api/users/:id" },
@@ -51,10 +47,8 @@ const ALLOW: Rule[] = [
 /**
  * Deliberately NOT proxied, so the reasoning survives the next person reading
  * the list above:
- *   /api/checkout/authorize     merchant-facing; the merchant calls the core
- *                               directly, it is not a browser route.
- *   /api/checkout/token,        merchant confidential exchange + polling; a
- *   /api/checkout/status/:id    client secret must never transit this origin.
+ *   /api/checkout/*             served by THIS service — it is the
+ *                               authorization server. Nothing to forward.
  *   /api/kyc/review             operator token; approving KYC is not a
  *                               checkout capability.
  *   /api/users/:id/kyc/mock-review, /api/simulate/*

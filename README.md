@@ -4,18 +4,29 @@ A hosted checkout page where someone who has never heard of Zold can create an
 account and pay a merchant without leaving the flow, and where an existing user
 can pay with a passkey and a device signature.
 
-It owns no users, no keys and no ledger. The core Zold API (`services/api` in
-the main repo) stays the source of truth; this service serves the checkout
-origin and forwards an allowlisted set of calls to it.
+This service is the **authorization server** for the merchant handoff: it owns
+the merchant registry, the payment intents, and the PKCE code exchange. It owns
+no users, keys or balances — the core Zold API (`services/api` in the main repo)
+stays the source of truth for those, and an allowlisted proxy is how the browser
+reaches it.
 
 ```
-merchant ──▶ core /api/checkout/authorize ──▶ checkout.zold.app/checkout?intent=…
-                                                      │
-                                                      ├─ new user: account → KYC → device key → funding → pay
-                                                      └─ existing user: passkey → pay
-                                                      │
-merchant ◀── code ── redirect_uri ◀───────────────────┘
+merchant ──▶ /api/checkout/authorize ──▶ checkout.zold.app/checkout?intent=…
+   (here)                                          │
+                                                   ├─ new user: account → KYC → device key → funding → pay
+                                                   └─ existing user: passkey → pay
+                                                   │        (both via the core API)
+merchant ◀── code ── redirect_uri ◀────────────────┘
+   │
+   └──▶ /api/checkout/token  (code + PKCE verifier + client secret → status)
 ```
+
+The checkout half briefly lived in the core repo. PR #68 removed it there —
+`main`'s CLAUDE.md now says *"Do not rebuild them here — see the checkout-service
+repo"* — so `checkout.ts` and the `Merchant`/`PaymentIntent` store are ported
+here, with one real change: the core validated a transfer by reading its own
+store, and this service reads it back from the core API **with the caller's own
+session**, which is also what proves the transfer is theirs.
 
 ---
 
@@ -80,17 +91,19 @@ npm install
 npm start
 ```
 
-Start a checkout as a merchant would, and open the URL it returns:
+Start a checkout as a merchant would, and open the `checkoutUrl` it returns:
 
 ```bash
-curl -s -H 'accept: application/json' "http://127.0.0.1:3000/api/checkout/authorize?client_id=demo-merchant&amount=40&reference=demo&redirect_uri=https%3A%2F%2Fmony.example%2Fcallback&state=xyz&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
+curl -s -H 'accept: application/json' "http://127.0.0.1:3100/api/checkout/authorize?client_id=demo-merchant&amount=40&reference=demo&redirect_uri=https%3A%2F%2Fmony.example%2Fcallback&state=xyz&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
 ```
 
-The core hands back a **relative** `checkoutUrl` (`/checkout.html?intent=…`).
-Resolve it against this origin: `http://localhost:3100/checkout?intent=…`.
-Pointing merchants here for real needs a `CHECKOUT_BASE_URL` in the core so
-`/api/checkout/authorize` redirects to this service — see *Changes the core
-still needs*.
+`checkoutUrl` is absolute (built from `CHECKOUT_PUBLIC_ORIGIN`), unlike the
+core's old relative `/checkout.html?intent=…` — the merchant redirects from its
+own origin, where a bare path would resolve against the wrong host.
+
+The `demo-merchant` client is seeded only when `ALLOW_DEV_SHORTCUTS=1`. There is
+**no merchant onboarding** yet: registering a real partner means adding a row to
+`data/checkout.json` by hand.
 
 ---
 
@@ -168,11 +181,12 @@ that file is copied verbatim here on purpose.
 
 ## The proxy allowlist
 
-The browser talks only to this origin; `server/src/proxy.ts` forwards a named
-list of core routes and 404s everything else. A blanket `/api/*` proxy would
-re-expose the operator KYC decision route, the Monerium OAuth callback and the
-webhook receiver on a new origin, each of which has its own assumptions about
-who can reach it. The list and the reasons for the exclusions are in that file.
+`/api/checkout/*` is served here. Everything else the browser needs is forwarded
+to the core by `server/src/proxy.ts`, which holds a named list and 404s the
+rest. A blanket `/api/*` proxy would re-expose the operator KYC decision route,
+the Monerium OAuth callback and the webhook receiver on a new origin, each of
+which has its own assumptions about who can reach it. The list and the reasons
+for the exclusions are in that file.
 
 `FORWARD_CLIENT_IP=1` (default) sends `X-Forwarded-For` so the core's per-IP
 rate limits key on the real client — set `TRUSTED_PROXY_HOPS` on the core to
@@ -191,10 +205,11 @@ npm run onboard:test
 
 Drives the whole new-user flow headlessly — account, KYC, device key, funding,
 the device-signed SEPA payment, attach, and the merchant's PKCE exchange
-(including a wrong verifier being rejected) — plus the proxy allowlist. Needs
-the core API running; it deliberately does not spawn or reset it, because the
-core's store is a single `db.json` at its repo root and a test in another repo
-has no business wiping it.
+(rejecting a wrong verifier, a wrong client secret, and a replayed code) — plus
+the proxy allowlist. It runs against its own `data/checkout-test.json`, and
+needs the core API running; it deliberately does not spawn or reset the core,
+because that store is a single `db.json` at its repo root and a test in another
+repo has no business wiping it.
 
 The two WebAuthn ceremonies cannot run headlessly. They are covered by
 [BROWSER-CHECKLIST.md](BROWSER-CHECKLIST.md), by hand, in a real browser.
@@ -205,33 +220,49 @@ npm run typecheck
 
 ---
 
-## Bugs this work found in the main repo
+## Two bugs the old page had
 
-Both are in `services/api/public/checkout.html` on `main`, and both are
-invisible to `scripts/checkout-test.ts` because that test drives the backend
-directly. Together they mean the existing checkout page cannot complete a
-payment in a browser.
+Both were in the core repo's `services/api/public/checkout.html`, and both were
+invisible to its `checkout-test.ts` because that test drove the backend
+directly. Together they meant the page could not complete a payment in a
+browser. The file has since been deleted from the core by PR #68, so they are
+recorded here to keep them from being reintroduced — this repo's page does not
+have them.
 
-1. **No import map.** The page loads `/device.js`, which transitively imports
+1. **No import map.** The page loaded `/device.js`, which transitively imports
    the bare specifiers `crypto` and `@noble/hashes/crypto`. `index.html` maps
-   them; `checkout.html` does not, so the module never loads, `deviceLib` never
-   resolves, and "Confirm with passkey" hangs.
+   them; `checkout.html` did not, so the module never loaded, `deviceLib` never
+   resolved, and "Confirm with passkey" hung.
 2. **`intent.id` is undefined.** `GET /api/checkout/intents/:id` returns
-   `statusView`, whose field is `intentId`. The page builds the attach URL from
-   `intent.id`, so it posts to `/api/checkout/intents/undefined/attach` and gets
-   "unknown checkout" *after* the payment has already been authorized on-chain
+   `statusView`, whose field is `intentId`. The page built the attach URL from
+   `intent.id`, so it posted to `/api/checkout/intents/undefined/attach` and got
+   "unknown checkout" *after* the payment had already been authorized on-chain
    — money moves, the merchant is never told.
 
-Both are fixed in this repo's page.
+---
+
+## Known gaps in this service
+
+**Intent status is captured at attach and does not advance.** The core version
+re-read the transfer from its own store on every status poll, so a payout that
+reached `PAID` later showed up. This service cannot: reading a transfer needs
+the user's session, and the merchant polls long after the user has gone. On the
+local chain the transfer is already `PAID` at attach so it never shows; on a
+real SEPA payout an intent would sit at `AUTHORIZED` forever. The fix is
+core-side — a checkout webhook, or a service credential that can read a transfer
+without a user session.
+
+**No merchant onboarding**, and `clientSecret` is stored in plaintext in
+`data/checkout.json`. Fine for a demo, not for a partner.
 
 ---
 
 ## Changes the core still needs
 
-- `CHECKOUT_BASE_URL` so `/api/checkout/authorize` can redirect to this service
-  instead of its own relative `/checkout.html`.
 - `RP_ID=zold.app` and both origins in `WEBAUTHN_ORIGINS`.
 - `TRUSTED_PROXY_HOPS` set to the real hop count.
+- A way for this service to observe a transfer reaching its terminal state
+  (see *Known gaps*).
 - A per-account device-key slot in `device.js` (see above).
 - Tiered KYC, if a low-friction first payment is wanted.
 
@@ -242,8 +273,10 @@ Both are fixed in this repo's page.
 ```
 server/src/config.ts    env; the loopback gate on the dev shortcuts
 server/src/core.ts      typed client for the core API (this service's own calls)
+server/src/store.ts     merchants + payment intents (JSON file)
+server/src/checkout.ts  the authorization-server logic, ported from the core
 server/src/proxy.ts     the allowlist
-server/src/server.ts    static page, /bff/* routes, proxy mount
+server/src/server.ts    checkout routes, /bff/* routes, proxy mount, static page
 web/checkout.html       the checkout + onboarding page
 web/device.js           VERBATIM copy from the main repo — see below
 web/vendor/             VERBATIM copy (noble secp256k1 + hashes)

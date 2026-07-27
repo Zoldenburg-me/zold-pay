@@ -21,6 +21,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -30,6 +31,7 @@ const CORE = (process.env.CORE_API_URL ?? "http://127.0.0.1:3000").replace(/\/+$
 const PORT = Number(process.env.CHECKOUT_TEST_PORT ?? 3113);
 const BFF = `http://127.0.0.1:${PORT}`;
 const AMOUNT = 40;
+const TEST_DB = path.join(ROOT, "data/checkout-test.json");
 
 let token = "";
 const children: ChildProcess[] = [];
@@ -89,6 +91,7 @@ try {
   }
 
   console.log("2/9 start the checkout service…");
+  rmSync(TEST_DB, { force: true });
   children.push(
     spawn(process.execPath, [path.join(ROOT, "node_modules/.bin/tsx"), "server/src/server.ts"], {
       cwd: ROOT,
@@ -99,6 +102,9 @@ try {
         CORE_API_URL: CORE,
         CHECKOUT_PUBLIC_ORIGIN: BFF,
         ALLOW_DEV_SHORTCUTS: "1",
+        // Its own store, so a test run cannot disturb merchants or intents a
+        // local demo is using.
+        CHECKOUT_DB_PATH: TEST_DB,
       },
     }),
   );
@@ -118,20 +124,29 @@ try {
   // reachable through it — the 404 comes from this service, not the core.
   assert.equal(await svcStatus("/api/kyc/review", "POST"), 404, "operator KYC review not proxied");
   assert.equal(await svcStatus("/api/simulate/sepa-deposit", "POST"), 404, "simulate deposit not proxied");
-  assert.equal(await svcStatus("/api/checkout/token", "POST"), 404, "merchant token exchange not proxied");
+  assert.equal(await svcStatus("/api/webhooks/monerium", "POST"), 404, "rail webhooks not proxied");
   assert.equal(await svcStatus("/api/users/x/monerium/accounts"), 404, "Monerium linking not proxied");
   assert.equal(await svcStatus("/api/health"), 200, "allowlisted route reaches the core");
+  // The core no longer serves /api/checkout/* at all (PR #68) — this service
+  // is the authorization server, so these must be answered locally.
+  assert.equal(
+    (await fetch(`${CORE}/api/checkout/intents/none`)).status,
+    404,
+    "the core has no checkout routes left to forward to",
+  );
 
   console.log("4/9 merchant starts a checkout (PKCE)…");
   const codeVerifier = randomBytes(48).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
   const state = randomBytes(8).toString("hex");
-  const authz = await coreApi(
+  const authz = await svc(
     `/api/checkout/authorize?client_id=demo-merchant&amount=${AMOUNT}&reference=mony-user-new` +
       `&redirect_uri=${encodeURIComponent("https://mony.example/callback")}&state=${state}` +
       `&code_challenge=${codeChallenge}&code_challenge_method=S256`,
-    undefined,
-    { accept: "application/json" },
+  );
+  assert.ok(
+    String(authz.checkoutUrl).startsWith(BFF),
+    `checkoutUrl is absolute and points at this service, got ${authz.checkoutUrl}`,
   );
   const intentId = authz.intentId as string;
   assert.ok(intentId, "intent created");
@@ -210,7 +225,7 @@ try {
   token = "";
   await assert.rejects(
     () =>
-      coreApi("/api/checkout/token", {
+      svc("/api/checkout/token", {
         client_id: "demo-merchant",
         client_secret: "demo-secret",
         code,
@@ -219,7 +234,18 @@ try {
     /PKCE/,
     "bad PKCE verifier rejected",
   );
-  const settled = await coreApi("/api/checkout/token", {
+  await assert.rejects(
+    () =>
+      svc("/api/checkout/token", {
+        client_id: "demo-merchant",
+        client_secret: "wrong-secret",
+        code,
+        code_verifier: codeVerifier,
+      }),
+    /client credentials/,
+    "bad client secret rejected",
+  );
+  const settled = await svc("/api/checkout/token", {
     client_id: "demo-merchant",
     client_secret: "demo-secret",
     code,
@@ -228,6 +254,25 @@ try {
   assert.equal(settled.status, "PAID", `expected PAID, got ${settled.status}`);
   assert.equal(settled.amountEur, AMOUNT);
   assert.equal(settled.reference, "mony-user-new", "merchant reference preserved");
+
+  // The code is one-time: a replay after the exchange must not mint a second
+  // status token.
+  await assert.rejects(
+    () =>
+      svc("/api/checkout/token", {
+        client_id: "demo-merchant",
+        client_secret: "demo-secret",
+        code,
+        code_verifier: codeVerifier,
+      }),
+    /unknown or used code/,
+    "burned code cannot be exchanged twice",
+  );
+
+  const polled = await svc(`/api/checkout/status/${intentId}`, undefined, {
+    authorization: `Bearer ${settled.statusToken}`,
+  });
+  assert.equal(polled.status, "PAID", "merchant can poll with the issued bearer");
 
   console.log(
     "\nONBOARD TEST PASSED — new user: account → KYC → device key → funded → device-signed SEPA → merchant code → PAID",
