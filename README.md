@@ -38,6 +38,12 @@ session**, which is also what proves the transfer is theirs.
 
 This is the decision everything else follows from, so it comes first.
 
+> **Under revision.** What follows describes what is built.
+> [ADR 0001](docs/adr/0001-serve-the-checkout-from-the-app-origin.md) proposes
+> replacing the two-subdomain layout with path routing on a single origin,
+> because the split removes the existing-user path rather than degrading it.
+> Do not provision `checkout.zold.app` before reading it.
+
 WebAuthn passkeys are scoped to a **relying-party id**, and the FP4 device key —
 the EOA the vault recognises as an account's `authorizer` — lives in **one
 origin's localStorage** and is bound **on-chain**. Neither travels across
