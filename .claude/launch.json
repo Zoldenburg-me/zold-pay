@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "zold-checkout",
+      "runtimeExecutable": "(local path removed)",
+      "runtimeArgs": ["node_modules/.bin/tsx", "server/src/server.ts"],
+      "port": 3100
+    }
+  ]
+}

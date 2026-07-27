@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pay with Zold</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23e6167f'/%3E%3Cpath d='M28 68 L52 30 L58 68 M44 32 L78 24' stroke='white' stroke-width='7' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<style>
+  :root { --bg:#0b0710; --card:#15101c; --line:#2a2233; --ink:#f5f2f8; --dim:#a99fb5; --acc:#e6167f; --ok:#33c98a; --bad:#ff5d73; --warn:#ffb454; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:
+    radial-gradient(1200px 500px at 50% -10%, #2a0f22 0%, transparent 60%), var(--bg);
+    color:var(--ink); min-height:100vh; display:grid; place-items:center; padding:1.25rem; }
+  .card { width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
+    border-radius:20px; padding:1.6rem; box-shadow:0 30px 80px rgba(0,0,0,.5); }
+  .brand { display:flex; align-items:center; gap:.5rem; font-weight:700; font-size:.9rem; color:var(--dim); margin-bottom:1.3rem; }
+  .brand b { color:var(--ink); }
+  .amt { text-align:center; margin:.4rem 0 1.4rem; }
+  .amt .lbl { color:var(--dim); font-size:.85rem; }
+  .amt .val { font-size:2.6rem; font-weight:800; letter-spacing:-.02em; margin-top:.15rem; }
+  .amt .to { color:var(--dim); font-size:.9rem; margin-top:.35rem; }
+  .amt .to b { color:var(--ink); }
+  .row { display:flex; justify-content:space-between; font-size:.86rem; padding:.5rem 0; border-top:1px solid var(--line); color:var(--dim); }
+  .row span:last-child { color:var(--ink); }
+  button { width:100%; margin-top:1.1rem; padding:.85rem; border:0; border-radius:12px; cursor:pointer;
+    font-weight:700; font-size:.95rem; color:#fff; background:linear-gradient(135deg,#a01463,#e6167f); }
+  button:hover { filter:brightness(1.08); }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--ink); font-weight:600; }
+  label { display:block; font-size:.8rem; color:var(--dim); margin:.9rem 0 .3rem; }
+  input, select { width:100%; padding:.7rem .8rem; border-radius:11px; border:1px solid var(--line);
+    background:#0f0b15; color:var(--ink); font:inherit; }
+  input:focus, select:focus { outline:0; border-color:var(--acc); }
+  .link { display:block; text-align:center; margin-top:1rem; color:var(--acc); font-size:.85rem; text-decoration:none; cursor:pointer; }
+  .muted { color:var(--dim); font-size:.8rem; text-align:center; margin-top:1rem; line-height:1.5; }
+  .muted.left { text-align:left; }
+  .err { margin-top:1rem; padding:.6rem .8rem; border-radius:10px; font-size:.84rem; background:rgba(255,93,115,.09); border:1px solid rgba(255,93,115,.3); color:var(--bad); }
+  .note { margin-top:1rem; padding:.6rem .8rem; border-radius:10px; font-size:.82rem; background:rgba(255,180,84,.08); border:1px solid rgba(255,180,84,.28); color:var(--warn); line-height:1.5; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.82rem; word-break:break-all; color:var(--ink); }
+  .done { text-align:center; }
+  .done .ic { width:60px; height:60px; border-radius:50%; margin:.5rem auto 1rem; display:grid; place-items:center;
+    background:rgba(51,201,138,.14); font-size:1.8rem; }
+  .done.bad .ic { background:rgba(255,93,115,.14); }
+  .spin { display:inline-block; width:16px; height:16px; border:2px solid rgba(255,255,255,.35); border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; vertical-align:-3px; margin-right:.5rem; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .steps { display:flex; gap:.4rem; justify-content:center; margin:0 0 1.2rem; }
+  .dot { width:26px; height:4px; border-radius:2px; background:var(--line); }
+  .dot.active { background:var(--acc); }
+  .dot.done { background:var(--ok); }
+  .title { font-weight:700; font-size:1.05rem; margin-bottom:.3rem; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand"><span>🦄</span> Pay with <b>Zold</b></div>
+
+    <div id="load" class="muted">Loading checkout…</div>
+
+    <!-- The amount block stays visible through the whole flow. -->
+    <div id="head" class="hidden">
+      <div class="amt">
+        <div class="lbl">Amount</div>
+        <div class="val" id="amt">€0.00</div>
+        <div class="to">to <b id="merchant">merchant</b></div>
+      </div>
+    </div>
+
+    <!-- Pick a path -->
+    <div id="choose" class="hidden">
+      <button id="btn-existing">I have a Zold account</button>
+      <button id="btn-new" class="ghost">New to Zold — create an account</button>
+      <div class="muted">You'll approve this payment with your device — Face&nbsp;ID, fingerprint, or screen lock. No passwords.</div>
+    </div>
+
+    <!-- New-user onboarding -->
+    <div id="wizard" class="hidden">
+      <div class="steps">
+        <div class="dot" id="d1"></div><div class="dot" id="d2"></div><div class="dot" id="d3"></div>
+        <div class="dot" id="d4"></div><div class="dot" id="d5"></div>
+      </div>
+
+      <div id="step-details">
+        <div class="title">Create your Zold account</div>
+        <div class="muted left">A Zold account is a smart wallet with its own IBAN. It takes about a minute to set up.</div>
+        <label for="f-name">Full name</label>
+        <input id="f-name" autocomplete="name" placeholder="Alex Müller" />
+        <label for="f-email">Email <span style="opacity:.6">(optional)</span></label>
+        <input id="f-email" type="email" autocomplete="email" placeholder="alex@example.com" />
+        <label for="f-country">Country</label>
+        <input id="f-country" autocomplete="country" placeholder="DE" maxlength="2" style="text-transform:uppercase" value="DE" />
+        <button id="btn-details">Continue</button>
+      </div>
+
+      <div id="step-passkey" class="hidden">
+        <div class="title">Set up your passkey</div>
+        <div class="muted left">Your passkey is how you sign in and approve payments. It stays on this device — Zold never sees it, and there is no password to steal.</div>
+        <button id="btn-passkey">Create passkey</button>
+      </div>
+
+      <div id="step-kyc" class="hidden">
+        <div class="title">Identity check</div>
+        <div class="muted left" id="kyc-note">Checking your account…</div>
+        <button id="btn-kyc-dev" class="hidden">Approve (local demo only)</button>
+        <button id="btn-kyc-recheck" class="ghost hidden">Check again</button>
+      </div>
+
+      <div id="step-device" class="hidden">
+        <div class="title">Set up your spending key</div>
+        <div class="muted left">Zold generates a key in this browser and registers it on-chain as the only key allowed to move your money. Zold's servers can't spend without it.</div>
+        <button id="btn-device">Create spending key</button>
+        <button id="btn-reset-key" class="ghost hidden">Reset this browser's spending key (local demo)</button>
+      </div>
+
+      <div id="step-fund" class="hidden">
+        <div class="title">Add money</div>
+        <div class="muted left" id="fund-note">Working out what you need…</div>
+        <div id="fund-iban" class="hidden">
+          <label>Your IBAN</label>
+          <div class="mono" id="iban-val">—</div>
+        </div>
+        <button id="btn-fund-dev" class="hidden">Simulate a deposit (local demo only)</button>
+        <button id="btn-fund-recheck" class="ghost">Check my balance</button>
+      </div>
+
+      <div id="step-pay" class="hidden">
+        <div class="row"><span>Fee</span><span id="fee">—</span></div>
+        <div class="row"><span>You pay</span><span id="total">—</span></div>
+        <div class="row"><span>Your balance</span><span id="bal">—</span></div>
+        <button id="btn-pay-new">Confirm with passkey</button>
+      </div>
+    </div>
+
+    <!-- Existing-user single-shot pay -->
+    <div id="pay" class="hidden">
+      <div class="row"><span>Fee</span><span id="fee2">—</span></div>
+      <div class="row"><span>You pay</span><span id="total2">—</span></div>
+      <button id="btn-pay">Confirm with passkey</button>
+      <a class="link" id="link-new">New to Zold? Create an account</a>
+    </div>
+
+    <div id="result" class="hidden done">
+      <div class="ic" id="ic">✓</div>
+      <div id="result-title" style="font-weight:700;font-size:1.1rem"></div>
+      <div class="muted" id="result-note"></div>
+      <div class="muted" id="redir-note"></div>
+    </div>
+
+    <div class="err hidden" id="err"></div>
+    <div class="note hidden" id="note"></div>
+  </div>
+
+<script type="importmap">
+{
+  "imports": {
+    "crypto": "/vendor/crypto-shim.js",
+    "@noble/hashes/crypto": "/vendor/hashes/cryptoBrowser.js"
+  }
+}
+</script>
+<script type="module" src="/device.js"></script>
+<script>
+/* ---------------------------------------------------------------------------
+ * Pay with Zold — checkout + inline onboarding.
+ *
+ * Everything here runs on the checkout origin. That matters: the passkey is
+ * created against the core API's relying-party id (returned with every
+ * challenge, never guessed from location.hostname), and the FP4 device key is
+ * generated into THIS origin's localStorage. A user onboarded here therefore
+ * has both halves in one place, which is the only self-consistent arrangement.
+ * ------------------------------------------------------------------------- */
+const $ = (id) => document.getElementById(id);
+const deviceLib = new Promise((r) => { window.__deviceLibReady = r; });
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+const b64urlToBytes = (s) => Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/")), (c) => c.charCodeAt(0));
+const fmt = (n) => "€" + Number(n).toLocaleString("en", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/* Which account this browser's single device-key slot belongs to. device.js
+   keeps one key per origin, not one per user; without this a second person
+   onboarding in the same browser would silently bind the first person's key as
+   their spending authorizer, and either could then spend the other's balance. */
+const KEY_OWNER_SLOT = "zold-checkout-key-owner";
+
+const intentId = new URLSearchParams(location.search).get("intent");
+let sessionToken = sessionStorage.getItem("zold-checkout-session") || null;
+let user = null, intent = null, cfg = { devShortcuts: false }, pendingInfo = null;
+
+async function request(path, body) {
+  const headers = {};
+  if (body) headers["content-type"] = "application/json";
+  if (sessionToken) headers.authorization = `Bearer ${sessionToken}`;
+  const res = await fetch(path, body ? { method:"POST", headers, body:JSON.stringify(body) } : { headers });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text.slice(0, 300) }; }
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+const api = (p, b) => request(p, b);        // proxied to the core Zold API
+const bff = (p, b) => request(p, b);        // this service's own routes
+
+const showErr = (e) => { const el = $("err"); el.textContent = e.message || String(e); el.classList.remove("hidden"); };
+const clearErr = () => $("err").classList.add("hidden");
+const showNote = (t) => { const el = $("note"); el.textContent = t; el.classList.remove("hidden"); };
+const clearNote = () => $("note").classList.add("hidden");
+const credId = () => user?.passkey?.credentialId || null;
+
+function show(...ids) {
+  for (const id of ["load","choose","wizard","pay","result"]) $(id).classList.add("hidden");
+  for (const id of ids) $(id).classList.remove("hidden");
+}
+function wizardStep(n, id) {
+  for (let i = 1; i <= 5; i++) $("d" + i).className = "dot" + (i < n ? " done" : i === n ? " active" : "");
+  for (const s of ["step-details","step-passkey","step-kyc","step-device","step-fund","step-pay"]) {
+    $(s).classList.toggle("hidden", s !== id);
+  }
+  show("head", "wizard");
+}
+function busy(btn, label) {
+  btn.disabled = true;
+  btn.dataset.label = btn.dataset.label || btn.textContent;
+  btn.innerHTML = `<span class="spin"></span>${label}`;
+}
+function idle(btn) {
+  btn.disabled = false;
+  btn.textContent = btn.dataset.label || btn.textContent;
+}
+
+function result(ok, title, note, redirNote) {
+  show("result");
+  $("result").classList.toggle("bad", !ok);
+  $("ic").textContent = ok ? "✓" : "✕";
+  $("result-title").textContent = title;
+  $("result-note").textContent = note || "";
+  $("redir-note").textContent = redirNote || "";
+}
+
+/* ---------- load ---------- */
+
+async function load() {
+  if (!intentId) { $("load").textContent = "Invalid checkout link."; return; }
+  try { cfg = await bff("/bff/config"); } catch { /* defaults are the safe ones */ }
+  try { intent = await api(`/api/checkout/intents/${encodeURIComponent(intentId)}`); }
+  catch { $("load").textContent = "This checkout could not be loaded."; return; }
+  if (intent.expired) return result(false, "Checkout expired", "Ask the merchant to start again.");
+  if (intent.status === "PAID") return result(true, "Already paid", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`);
+  $("amt").textContent = fmt(intent.amountEur);
+  $("merchant").textContent = intent.merchant || "the merchant";
+  show("head", "choose");
+}
+
+/* ---------- WebAuthn ---------- */
+
+/* The relying-party id comes from the core API, not from location.hostname.
+   With app.zold.app and checkout.zold.app both setting rp.id = "zold.app", a
+   passkey made here also works in the consumer app; hardcoding the hostname
+   would scope it to this origin alone and quietly break that. */
+async function registerPasskey(u, info) {
+  if (!window.PublicKeyCredential) throw new Error("passkeys aren't supported in this browser");
+  const { challenge, rpId } = await api("/api/webauthn/challenge", { purpose: "register" });
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: b64urlToBytes(challenge),
+      rp: { name: "Zold", id: rpId },
+      user: {
+        id: new TextEncoder().encode(u.id),
+        name: info.email || info.name,
+        displayName: info.name,
+      },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { residentKey: "preferred", userVerification: "preferred" },
+      timeout: 60000,
+      // FP4: the PRF extension lets this passkey encrypt the device spending
+      // key. Authenticators without it still register — device.js says so.
+      extensions: { prf: {} },
+    },
+  });
+  const updated = await api(`/api/users/${u.id}/passkey`, {
+    credentialId: cred.id,
+    attestation: b64url(cred.response.attestationObject),
+    clientDataJSON: b64url(cred.response.clientDataJSON),
+  });
+  user = { ...user, passkey: updated.passkey };
+  return cred.getClientExtensionResults?.().prf?.enabled === true;
+}
+
+async function passkeyStepUp() {
+  if (!credId()) return null;
+  const { challenge } = await api("/api/webauthn/challenge", { purpose: "step_up" });
+  const cred = await navigator.credentials.get({
+    publicKey: {
+      challenge: b64urlToBytes(challenge),
+      allowCredentials: [{ type: "public-key", id: b64urlToBytes(credId()) }],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+  return {
+    credentialId: cred.id,
+    authenticatorData: b64url(cred.response.authenticatorData),
+    clientDataJSON: b64url(cred.response.clientDataJSON),
+    signature: b64url(cred.response.signature),
+  };
+}
+
+async function signIn() {
+  if (!window.PublicKeyCredential) throw new Error("passkeys aren't supported in this browser");
+  const { challenge } = await api("/api/webauthn/challenge", { purpose: "login" });
+  const cred = await navigator.credentials.get({
+    publicKey: { challenge: b64urlToBytes(challenge), userVerification: "preferred", timeout: 60000 },
+  });
+  const u = await api("/api/passkey/login", {
+    credentialId: cred.id,
+    authenticatorData: b64url(cred.response.authenticatorData),
+    clientDataJSON: b64url(cred.response.clientDataJSON),
+    signature: b64url(cred.response.signature),
+  });
+  sessionToken = u.sessionToken;
+  sessionStorage.setItem("zold-checkout-session", sessionToken);
+  user = u;
+  return u;
+}
+
+/* ---------- payment ---------- */
+
+/* Two quotes: the first reveals the flat fee, the second sizes the send so the
+   merchant receives exactly the intent amount. Quotes are sender-fixed. */
+async function quoteForMerchant() {
+  const probe = await api("/api/quotes", { userId: user.id, rail: "sepa", sendEur: intent.amountEur });
+  const fee = Math.round((probe.sendEur - probe.receiveEur) * 100) / 100;
+  const quote = await api("/api/quotes", { userId: user.id, rail: "sepa", sendEur: intent.amountEur + fee });
+  return { quote, fee };
+}
+
+async function payAndAttach(quote) {
+  const recipient = { recipientName: intent.merchant || "Merchant", recipientIban: intent.merchantIban };
+  const created = await api("/api/transfers", { quoteId: quote.id, ...recipient });
+
+  const dev = await deviceLib;
+  if (!dev.keyStatus().present) {
+    throw new Error("this browser has no spending key for your account — pay from the device you set Zold up on");
+  }
+  const addr = await dev.deviceAddress(credId());
+  if (created.authorization.authorizer.toLowerCase() !== addr.toLowerCase()) {
+    throw new Error("your spending key was set up in a different browser — pay from that device, or open the Zold app to rotate it");
+  }
+  // Recompute what the server asked us to sign from the recipient we can see.
+  // A server that swapped the merchant's IBAN is caught here, before the
+  // passkey ever unlocks the key.
+  const expected = dev.destinationCommitment("sepa", { iban: recipient.recipientIban, name: recipient.recipientName });
+  if (created.authorization.typedData.message.destination.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error("the signed payout destination does not match this merchant — not signing");
+  }
+  const signature = await dev.signTypedData(created.authorization.typedData, credId());
+  const t = await api(`/api/transfers/${created.id}/authorize`, { signature });
+  // The intent view calls this field `intentId`, not `id` — reading `intent.id`
+  // here sends "undefined" and the attach 404s as "unknown checkout".
+  const { redirectUrl } = await api(`/api/checkout/intents/${intentId}/attach`, { transferId: t.id });
+  return redirectUrl;
+}
+
+function finish(redirectUrl) {
+  result(true, "Payment sent", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`, "Returning to the merchant…");
+  setTimeout(() => { location.href = redirectUrl; }, 1400);
+}
+
+/* ---------- existing-user path ---------- */
+
+$("btn-existing").onclick = async () => {
+  clearErr();
+  show("head", "pay");
+  $("btn-pay").click();
+};
+
+$("btn-pay").onclick = async () => {
+  clearErr();
+  const btn = $("btn-pay");
+  busy(btn, "Signing in…");
+  try {
+    if (!user) await signIn();
+    const me = await api(`/api/users/${user.id}`);
+    busy(btn, "Preparing…");
+    const { quote, fee } = await quoteForMerchant();
+    $("fee2").textContent = fmt(fee);
+    $("total2").textContent = fmt(quote.sendEur);
+    if ((me.balanceEur ?? 0) < quote.sendEur - 0.001) {
+      throw new Error(`Not enough balance (${fmt(me.balanceEur ?? 0)}). Top up in the Zold app, then return here.`);
+    }
+    busy(btn, "Approve on your device…");
+    finish(await payAndAttach(quote));
+  } catch (e) {
+    showErr(e);
+    idle(btn);
+  }
+};
+
+$("link-new").onclick = () => startWizard();
+
+/* ---------- new-user path ---------- */
+
+function startWizard() {
+  clearErr(); clearNote();
+  wizardStep(1, "step-details");
+}
+$("btn-new").onclick = startWizard;
+
+$("btn-details").onclick = () => {
+  clearErr();
+  const name = $("f-name").value.trim();
+  if (!name) return showErr(new Error("please enter your name"));
+  const email = $("f-email").value.trim();
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return showErr(new Error("that email doesn't look right"));
+  }
+  const country = ($("f-country").value.trim() || "DE").toUpperCase();
+  if (!/^[A-Z]{2}$/.test(country)) return showErr(new Error("country should be a two-letter code, e.g. DE"));
+  pendingInfo = { name, email: email || undefined, country };
+  wizardStep(2, "step-passkey");
+};
+
+$("btn-passkey").onclick = async () => {
+  clearErr(); clearNote();
+  const btn = $("btn-passkey");
+  busy(btn, "Creating your account…");
+  try {
+    if (!user) {
+      const u = await api("/api/users", pendingInfo);
+      sessionToken = u.sessionToken;
+      sessionStorage.setItem("zold-checkout-session", sessionToken);
+      user = u;
+    }
+    busy(btn, "Waiting for your passkey…");
+    const prf = await registerPasskey(user, pendingInfo);
+    if (!prf) {
+      // Say it rather than pretend: without PRF the device key is stored
+      // unwrapped and this browser profile is the only thing protecting it.
+      showNote("This device can't encrypt your spending key with the passkey. Your key is still private to this browser, but anyone with access to this browser profile could use it.");
+    }
+    await runKycStep();
+  } catch (e) {
+    showErr(e);
+    idle(btn);
+  }
+};
+
+/* KYC comes BEFORE the spending key, not after: the core API refuses to bind
+   an authorizer for an account that is not approved. */
+async function runKycStep() {
+  wizardStep(3, "step-kyc");
+  $("btn-kyc-dev").classList.add("hidden");
+  $("btn-kyc-recheck").classList.add("hidden");
+  $("kyc-note").textContent = "Checking your account…";
+  const k = await api(`/api/users/${user.id}/kyc`);
+  if (k.kycStatus === "approved") return runDeviceStep();
+  if (k.kycStatus === "rejected") {
+    return result(false, "We can't open an account", "Your identity check was not approved, so this payment can't go ahead.");
+  }
+  if (cfg.devShortcuts) {
+    $("kyc-note").textContent = "This is a local demo build, so you can approve your own account. A real deployment sends you through an identity provider here.";
+    $("btn-kyc-dev").classList.remove("hidden");
+    return;
+  }
+  $("kyc-note").textContent =
+    k.kycStatus === "manual_review"
+      ? "Your account is with our reviewers. This usually finishes within a few hours — we'll email you, and this checkout link stays valid for 15 minutes."
+      : "Your account needs an identity check before it can hold or send money. Finish it in the Zold app, then come back to this checkout.";
+  $("btn-kyc-recheck").classList.remove("hidden");
+}
+$("btn-kyc-recheck").onclick = async () => {
+  clearErr();
+  const btn = $("btn-kyc-recheck");
+  busy(btn, "Checking…");
+  try { await runKycStep(); } catch (e) { showErr(e); } finally { idle(btn); }
+};
+$("btn-kyc-dev").onclick = async () => {
+  clearErr();
+  const btn = $("btn-kyc-dev");
+  busy(btn, "Approving…");
+  try {
+    await bff("/bff/dev/kyc-approve", { userId: user.id });
+    await runKycStep();
+  } catch (e) { showErr(e); idle(btn); }
+};
+
+/* FP4: mint the device key in this browser and bind it on-chain as the only
+   key allowed to debit this account. */
+const SHARED_KEY_REFUSAL =
+  "this browser already holds a spending key for a different Zold account — finish in a private window, or on your own device";
+
+/* Binding this browser's key to a second account would give whoever holds it
+   spending rights over both. The check lives here, not only in the button's
+   visibility, so that hiding the control is presentation and refusing is the
+   rule. */
+async function keyBelongsToAnotherAccount() {
+  const dev = await deviceLib;
+  const owner = localStorage.getItem(KEY_OWNER_SLOT);
+  return dev.keyStatus().present && !!owner && owner !== user.id;
+}
+
+async function runDeviceStep() {
+  wizardStep(4, "step-device");
+  if (await keyBelongsToAnotherAccount()) {
+    $("btn-device").classList.add("hidden");
+    showErr(new Error(SHARED_KEY_REFUSAL));
+    if (cfg.devShortcuts) $("btn-reset-key").classList.remove("hidden");
+    return;
+  }
+  $("btn-device").classList.remove("hidden");
+}
+
+$("btn-device").onclick = async () => {
+  clearErr();
+  const btn = $("btn-device");
+  busy(btn, "Waiting for your passkey…");
+  try {
+    if (await keyBelongsToAnotherAccount()) throw new Error(SHARED_KEY_REFUSAL);
+    const dev = await deviceLib;
+    const { address, protection } = dev.keyStatus().present
+      ? { address: await dev.deviceAddress(credId()), protection: dev.keyStatus().protection }
+      : await dev.createKey(credId());
+    const updated = await api(`/api/users/${user.id}/authorizer`, { address, stepUp: await passkeyStepUp() });
+    localStorage.setItem(KEY_OWNER_SLOT, user.id);
+    if (updated.authorizerAddress) user = { ...user, authorizerAddress: updated.authorizerAddress };
+    if (protection !== "prf") {
+      showNote("Your spending key is stored unencrypted in this browser — this device's authenticator doesn't support the PRF extension.");
+    }
+    await runFundStep();
+  } catch (e) {
+    showErr(e);
+    idle(btn);
+  }
+};
+
+/* The honest step. A brand-new account has €0 and there is no instant funding
+   rail: a SEPA credit takes as long as SEPA takes, and card / open-banking
+   funding is not integrated. We say what is needed and wait. */
+let needed = 0;
+async function runFundStep() {
+  wizardStep(5, "step-fund");
+  clearErr();
+  const me = await api(`/api/users/${user.id}`);
+  user = { ...user, ...me };
+  const { quote, fee } = await quoteForMerchant();
+  needed = quote.sendEur;
+  $("fee").textContent = fmt(fee);
+  $("total").textContent = fmt(quote.sendEur);
+  $("bal").textContent = fmt(me.balanceEur ?? 0);
+
+  if ((me.balanceEur ?? 0) >= needed - 0.001) return runPayStep();
+
+  const short = needed - (me.balanceEur ?? 0);
+  $("fund-note").textContent =
+    `You need ${fmt(needed)} to pay ${fmt(intent.amountEur)} plus the ${fmt(fee)} fee, and your balance is ${fmt(me.balanceEur ?? 0)}. ` +
+    `Transfer ${fmt(short)} to your new IBAN and come back — a SEPA credit is not instant, so this checkout link (15 minutes) may expire first.`;
+  if (me.iban) {
+    $("iban-val").textContent = me.iban;
+    $("fund-iban").classList.remove("hidden");
+  } else {
+    $("fund-iban").classList.add("hidden");
+    $("fund-note").textContent += " Your IBAN is still being issued — check again in a moment.";
+  }
+  $("btn-fund-dev").classList.toggle("hidden", !cfg.devShortcuts || !me.iban);
+  if (cfg.devShortcuts) $("btn-fund-dev").textContent = `Simulate a ${fmt(Math.ceil(short))} deposit (local demo only)`;
+}
+$("btn-fund-recheck").onclick = async () => {
+  clearErr();
+  const btn = $("btn-fund-recheck");
+  busy(btn, "Checking…");
+  try { await runFundStep(); } catch (e) { showErr(e); } finally { idle(btn); }
+};
+$("btn-fund-dev").onclick = async () => {
+  clearErr();
+  const btn = $("btn-fund-dev");
+  busy(btn, "Crediting…");
+  try {
+    const me = await api(`/api/users/${user.id}`);
+    const short = Math.max(1, Math.ceil(needed - (me.balanceEur ?? 0)));
+    await bff("/bff/dev/fund", { iban: me.iban, amountEur: short });
+    await runFundStep();
+  } catch (e) { showErr(e); idle(btn); }
+};
+
+async function runPayStep() {
+  wizardStep(5, "step-pay");
+  const me = await api(`/api/users/${user.id}`);
+  $("bal").textContent = fmt(me.balanceEur ?? 0);
+}
+
+$("btn-pay-new").onclick = async () => {
+  clearErr();
+  const btn = $("btn-pay-new");
+  busy(btn, "Preparing…");
+  try {
+    const { quote, fee } = await quoteForMerchant();
+    $("fee").textContent = fmt(fee);
+    $("total").textContent = fmt(quote.sendEur);
+    busy(btn, "Approve on your device…");
+    finish(await payAndAttach(quote));
+  } catch (e) {
+    showErr(e);
+    idle(btn);
+  }
+};
+
+/* Local demo only: drop this browser's device key so a fresh account can be
+   onboarded here. Destructive — an account already bound to that key on-chain
+   can never be spent from again, because only the current authorizer can
+   rotate it. That is exactly why this is not offered outside a demo build. */
+$("btn-reset-key").onclick = () => {
+  if (!cfg.devShortcuts) return;
+  if (!confirm("Delete this browser's spending key? Any account bound to it becomes permanently unspendable.")) return;
+  localStorage.removeItem("zold-device-key");
+  localStorage.removeItem("zoll-device-key");
+  localStorage.removeItem(KEY_OWNER_SLOT);
+  location.reload();
+};
+
+load();
+</script>
+</body>
+</html>
