@@ -207,6 +207,70 @@ from this process, on loopback, without a forwarding header.
 
 ---
 
+## The core API contract this service depends on
+
+Nothing in the core repo's tests exercises this one, so a shape change there
+breaks this silently — the failure surfaces as a user stuck mid-checkout, not
+as a red build. If you are changing any of these in `transF`, this is the list.
+
+**Passkey auth is being reworked in the core (July 2026)** — another agent is
+implementing passkey-based auth and will then add usernames per UserID. That is
+compatible with everything below; see *Where usernames fit* at the end.
+
+### Auth — the sharp edges
+
+| Endpoint | What this service relies on |
+|---|---|
+| `POST /api/webauthn/challenge` | Body `{purpose: "register" \| "login" \| "step_up"}`. Returns `{challenge, rpId}`. The page uses the returned **`rpId`**, never `location.hostname` — hardcoding the hostname would scope passkeys to one origin and quietly break the shared-RP-ID layout. `register` and `step_up` require a session. |
+| `POST /api/passkey/login` | Body `{credentialId, authenticatorData, clientDataJSON, signature}` — no username field today. Returns the user **plus `sessionToken`**. Identifies by credential (`findUserByCredential`), i.e. a discoverable credential. |
+| `POST /api/users/:id/passkey` | Body `{credentialId, attestation, clientDataJSON}` and, when a passkey already exists, a `stepUp`. Returns `publicUser` including `passkey.credentialId` — the page needs that id to unwrap the device key via PRF. |
+| `POST /api/users/:id/authorizer` | Body `{address, stepUp}`, where `stepUp` is a full assertion `{credentialId, authenticatorData, clientDataJSON, signature}`. **The most fragile one.** If a username-first flow changes what a step-up assertion looks like, device-key binding breaks at exactly the step where a new user is mid-checkout, with money already in their account. |
+
+### Everything else
+
+| Endpoint | What this service relies on |
+|---|---|
+| `POST /api/users` | `{name, country, email?}` → user + `sessionToken`. |
+| `GET /api/users/:id` | `balanceEur`, `iban`, `kycStatus`, `authorizerAddress`. |
+| `GET /api/users/:id/kyc` | `kycStatus` of `approved` / `pending` / `rejected` / `manual_review`. |
+| `POST /api/quotes` | `{userId, rail: "sepa", sendEur}` → `{id, sendEur, receiveEur}`. Sender-fixed, so the page quotes twice to size the send. |
+| `POST /api/transfers` | `{quoteId, recipientName, recipientIban}` → transfer plus `authorization.{authorizer, typedData}`. |
+| `POST /api/transfers/:id/authorize` | `{signature}` → the transfer in a settled state. |
+| `GET /api/transfers/:id` | Session-scoped. Attach reads the transfer with the **caller's own bearer** — that is what proves the transfer is theirs, so this must stay session-scoped rather than becoming public. |
+
+Also load-bearing, and not an endpoint:
+
+- **`destinationCommitment` in `chain.ts` must stay byte-identical** to the copy
+  in `web/device.js`. The page recomputes the commitment from the recipient it
+  can see and refuses to sign on a mismatch. Change one side only and every
+  checkout payment refuses — correctly, and confusingly.
+- **`requireKycApproved` on `/api/users/:id/authorizer`** is what forces KYC
+  before the device key. Relax it and the onboarding order here becomes wrong.
+
+### Where usernames fit
+
+The seamless flow in [ADR 0001](docs/adr/0001-serve-the-checkout-from-the-app-origin.md)
+opens with a `mediation: "conditional"` passkey prompt: existing users tap and
+pay, everyone else falls through to onboarding without being asked. Its weak
+spot is that it needs a **discoverable** credential to appear in the picker, and
+not every authenticator stores one.
+
+Usernames per UserID are the fallback that closes it:
+
+1. Conditional UI on load → tap → paid.
+2. Nothing in the picker → ask for the username → server returns
+   `allowCredentials` for that id → same ceremony.
+
+Still one entry point. The username is a recovery path for the picker, not a
+second login system — so `POST /api/passkey/login` should **gain** an optional
+identifier rather than require one, or this page has to ask every user for a
+username before it knows whether it needed to.
+
+None of this affects ADR 0001 stage 2 (passkey as a Safe owner). That is about
+*spending* authority, not identification.
+
+---
+
 ## Tests
 
 ```bash
