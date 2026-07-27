@@ -246,7 +246,11 @@ try {
     quoteId: quote.id,
     recipientName: intent.merchant || "Mony (demo)",
     recipientIban: intent.merchantIban,
+    reference: intent.reference,
   });
+  // Only meaningful against a core that carries it; older cores ignore the
+  // field, so this asserts the wiring rather than the bank statement.
+  assert.equal(created.reference, "mony-user-new", "the merchant reference is stored on the transfer");
   assert.equal(
     created.authorization.authorizer.toLowerCase(),
     device.address.toLowerCase(),

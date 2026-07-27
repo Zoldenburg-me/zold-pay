@@ -278,30 +278,28 @@ secret returns:
   a merchant agreement, and it is deliberately absent from the unauthenticated
   `GET /api/checkout/intents/:id` the checkout page reads.
 
-### Not done: the reference does not reach the bank
+### The reference on the bank statement
 
-**The merchant's `reference` does not currently appear on the SEPA payment.**
-The rail supports it — `redeemToIban` in the core takes a `memo` and passes it
-to Monerium — but the orchestrator hardcodes it:
+The checkout sends the merchant's `reference` on `POST /api/transfers`, and the
+core carries it into the SEPA remittance line, so the payee reconciles against
+their own handle instead of our uuid.
 
-```js
-const order = await redeemToIban(user, payoutEur, counterpart, `Zold ${transfer.id}`);
-```
+That core half is **not on `main` yet** — it is `claude/sepa-payment-reference`
+in `transF` (PR pending). Against a core without it the field is ignored and the
+payment still arrives labelled `Zold <our uuid>`; nothing breaks, the merchant
+just cannot reconcile from their statement.
 
-So the money arrives labelled with *our* internal uuid. A merchant reconciling
-against its bank statement still cannot tell which of its users paid, which is
-the manual step this product is supposed to remove. Closing it needs a change
-in the core repo, not here:
+The scheme's limits shape it: SEPA carries 140 characters of unstructured
+remittance information in a restricted Latin subset. The core folds accents
+rather than blanking them ("Müller" arrives as "Muller"), strips the reserved
+slash forms, and truncates the reference rather than our transfer id. This
+service refuses a reference over 140 characters at creation instead of
+truncating the thing the merchant reconciles on.
 
-1. `POST /api/transfers` accepts an optional `reference` and persists it.
-2. The orchestrator passes it as the memo, keeping a short form of our transfer
-   id alongside it so our own reconciliation survives.
-3. Sanitise to the SEPA remittance charset and 140 characters — this service
-   already refuses a longer reference at creation rather than truncating the
-   thing the merchant reconciles on.
-
-Until that lands, `reference` is an API-level identifier only: correct in the
-token exchange, absent from the bank statement.
+The reference is **not** covered by the signed destination commitment — it
+decides what the payee reads, not who gets paid. A tampered reference would
+cause a reconciliation mismatch, not a mis-credit, and the merchant's own
+mapping comes from the intent it created rather than from the statement.
 
 ---
 

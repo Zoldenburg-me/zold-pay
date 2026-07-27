@@ -334,7 +334,15 @@ async function quoteForMerchant() {
 
 async function payAndAttach(quote) {
   const recipient = { recipientName: intent.merchant || "Merchant", recipientIban: intent.merchantIban };
-  const created = await api("/api/transfers", { quoteId: quote.id, ...recipient });
+  // The merchant's own reference rides on the SEPA payment, so the money
+  // arrives on their statement tied to their user rather than to our uuid.
+  // Not covered by the signed destination commitment: it decides what the
+  // payee reads, not who gets paid.
+  const created = await api("/api/transfers", {
+    quoteId: quote.id,
+    ...recipient,
+    ...(intent.reference ? { reference: intent.reference } : {}),
+  });
 
   const dev = await deviceLib;
   if (!dev.keyStatus().present) {
