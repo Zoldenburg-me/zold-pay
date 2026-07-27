@@ -207,6 +207,104 @@ from this process, on loopback, without a forwarding header.
 
 ---
 
+## Merchant integration
+
+### Starting a checkout
+
+**Back channel (preferred).** Authenticated with the client secret, so the
+merchant can name which of its settlement accounts to be paid into:
+
+```bash
+curl -s -X POST https://app.zold.app/api/checkout/intents \
+  -H 'content-type: application/json' \
+  -d '{
+    "client_id": "…", "client_secret": "…",
+    "amount": 40.00,
+    "destination_iban": "DE02120300000000202051",
+    "reference": "mony-user-8412/topup-77af",
+    "redirect_uri": "https://mony.example/callback",
+    "state": "…", "code_challenge": "…", "code_challenge_method": "S256"
+  }'
+```
+
+→ `{intentId, checkoutUrl, merchant, amountEur, destinationIban, reference, expiresAt}`.
+Redirect the user to `checkoutUrl`.
+
+**Front channel.** `GET /api/checkout/authorize?client_id=…&amount=…` still
+works for the simple case and needs no secret — but it **cannot** choose a
+destination, and says so if you try. `client_id` is public, so a destination
+selectable from a URL would let anyone who has seen a checkout link mint one
+that looks like the merchant and pays an account of their choosing. The
+authenticated call is what makes a per-transaction destination safe; the
+allowlist is what keeps it safe if the secret leaks.
+
+### Destination accounts
+
+A merchant registers one or more settlement IBANs. `destination_iban` must be
+one of them; omit it for the first. Unregistered accounts are refused even with
+a valid secret. The chosen account is **pinned to the intent**, so changing the
+allowlist mid-checkout neither invalidates a payment the user has already
+signed nor makes a newly-added account payable for an intent that never named
+it. Attach validates the transfer against that pinned value.
+
+There is no merchant onboarding UI — registering a merchant means adding a row
+to `data/checkout.json`, and `clientSecret` is stored there in plaintext.
+
+### Getting the result
+
+`POST /api/checkout/token` with the code, the PKCE verifier and the client
+secret returns:
+
+```json
+{
+  "intentId": "…", "status": "PAID", "amountEur": 40,
+  "reference": "mony-user-8412/topup-77af",
+  "destinationIban": "DE02120300000000202051",
+  "transferId": "…",
+  "payer": { "sub": "8Qk2…", "name": "Alex Müller" },
+  "statusToken": "…"
+}
+```
+
+- **`reference`** is echoed back verbatim, so the merchant maps the payment to
+  its own user and transaction.
+- **`payer.sub`** is `HMAC(CHECKOUT_SUBJECT_SECRET, merchantId + userId)` —
+  stable for this merchant so a returning customer is recognisable, and
+  uncorrelatable with any other merchant's id for the same person. Rotating
+  `CHECKOUT_SUBJECT_SECRET` turns every repeat payer into a stranger, which is
+  why the service refuses to start without it rather than generating one.
+- **`payer.name`** is the payer's legal name, for evidencing that a top-up is
+  first-party. Real PII crossing to a third party: it needs a lawful basis and
+  a merchant agreement, and it is deliberately absent from the unauthenticated
+  `GET /api/checkout/intents/:id` the checkout page reads.
+
+### Not done: the reference does not reach the bank
+
+**The merchant's `reference` does not currently appear on the SEPA payment.**
+The rail supports it — `redeemToIban` in the core takes a `memo` and passes it
+to Monerium — but the orchestrator hardcodes it:
+
+```js
+const order = await redeemToIban(user, payoutEur, counterpart, `Zold ${transfer.id}`);
+```
+
+So the money arrives labelled with *our* internal uuid. A merchant reconciling
+against its bank statement still cannot tell which of its users paid, which is
+the manual step this product is supposed to remove. Closing it needs a change
+in the core repo, not here:
+
+1. `POST /api/transfers` accepts an optional `reference` and persists it.
+2. The orchestrator passes it as the memo, keeping a short form of our transfer
+   id alongside it so our own reconciliation survives.
+3. Sanitise to the SEPA remittance charset and 140 characters — this service
+   already refuses a longer reference at creation rather than truncating the
+   thing the merchant reconciles on.
+
+Until that lands, `reference` is an API-level identifier only: correct in the
+token exchange, absent from the bank statement.
+
+---
+
 ## The core API contract this service depends on
 
 Nothing in the core repo's tests exercises this one, so a shape change there

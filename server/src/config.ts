@@ -61,6 +61,17 @@ export const CONFIG = {
 
   /** Max JSON body accepted from the browser. */
   jsonBodyLimit: process.env.JSON_BODY_LIMIT ?? "64kb",
+
+  /**
+   * HMAC key for the per-merchant pseudonymous payer subject.
+   *
+   * Must be stable for the life of the deployment: it is what makes a repeat
+   * payer recognisable to a merchant, so rotating it silently turns every
+   * returning customer into a new one. Kept separate from the merchants' own
+   * client secrets for exactly that reason — a secret rotation must not
+   * reshuffle identities.
+   */
+  subjectSecret: process.env.CHECKOUT_SUBJECT_SECRET ?? "",
 };
 
 /** Is the configured core API a loopback address? */
@@ -83,6 +94,13 @@ export function devShortcutsEnabled(): boolean {
 }
 
 export function assertConfigSane(): void {
+  if (!CONFIG.subjectSecret) {
+    throw new Error(
+      "CHECKOUT_SUBJECT_SECRET is not set. It keys the pseudonymous payer id merchants use to " +
+        "recognise a returning customer, so it cannot be generated per start — refusing to run " +
+        "rather than handing every merchant a different answer after each restart.",
+    );
+  }
   if (CONFIG.allowDevShortcuts && !coreIsLoopback()) {
     throw new Error(
       `ALLOW_DEV_SHORTCUTS=1 but CORE_API_URL is ${CONFIG.coreApiUrl}, which is not loopback. ` +

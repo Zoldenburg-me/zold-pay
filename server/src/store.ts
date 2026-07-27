@@ -22,8 +22,16 @@ export interface Merchant {
   name: string;
   clientId: string;
   clientSecret: string;
-  /** Where the merchant is paid: the SEPA account the checkout transfer targets. */
-  ibanTarget: string;
+  /**
+   * The SEPA accounts this merchant may be paid into. An allowlist, not a
+   * single value: a merchant with per-market or per-entity settlement accounts
+   * names one per transaction on the back channel. The first is the default.
+   *
+   * It stays an allowlist because `client_id` is public and the front-channel
+   * authorize needs no secret — a merchant free to name any IBAN in a URL turns
+   * a leaked client id into a payment-redirect vector.
+   */
+  settlementIbans: string[];
   /** Exact redirect URIs, or ["*"] for the local demo merchant only. */
   redirectUris: string[];
   webhookUrl?: string;
@@ -37,12 +45,25 @@ export interface PaymentIntent {
   merchantId: string;
   amountEur: number;
   reference: string;
+  /**
+   * The settlement account this specific payment must land in, resolved from
+   * the merchant's allowlist when the intent was created. Pinned per intent so
+   * that attach validates against what the merchant asked for at the time,
+   * not against whatever the allowlist happens to contain when the user
+   * finishes paying.
+   */
+  destinationIban: string;
   redirectUri: string;
   state: string;
   codeChallenge: string;
   status: IntentStatus;
   userId?: string;
   transferId?: string;
+  /** Per-merchant pseudonymous payer id, captured at attach. */
+  payerSub?: string;
+  /** Payer's legal name, captured at attach so the merchant can evidence a
+   *  first-party top-up. PII: disclosed to one merchant, for one payment. */
+  payerName?: string;
   /** One-time authorization code, burned at token exchange. */
   code?: string;
   /** Bearer the merchant polls status with, issued at token exchange. */
@@ -61,14 +82,35 @@ const DB_PATH = process.env.CHECKOUT_DB_PATH ?? path.join(ROOT, "data/checkout.j
 let db: Db = { merchants: [], paymentIntents: [] };
 
 export function initStore(): void {
-  if (existsSync(DB_PATH)) {
-    try {
-      const raw = JSON.parse(readFileSync(DB_PATH, "utf8"));
-      db = { merchants: raw.merchants ?? [], paymentIntents: raw.paymentIntents ?? [] };
-    } catch (e: any) {
-      throw new Error(`could not read ${DB_PATH}: ${e?.message ?? e}`);
-    }
+  if (!existsSync(DB_PATH)) return;
+  let raw: any;
+  try {
+    raw = JSON.parse(readFileSync(DB_PATH, "utf8"));
+  } catch (e: any) {
+    throw new Error(`could not read ${DB_PATH}: ${e?.message ?? e}`);
   }
+  let migrated = false;
+  const merchants: Merchant[] = (raw.merchants ?? []).map((m: any) => {
+    // Pre-allowlist shape: a single ibanTarget. Carry it forward as the one
+    // allowed settlement account rather than dropping it, which would leave
+    // every existing merchant unable to be paid.
+    if (!Array.isArray(m.settlementIbans)) {
+      migrated = true;
+      const { ibanTarget, ...rest } = m;
+      return { ...rest, settlementIbans: ibanTarget ? [ibanTarget] : [] };
+    }
+    return m;
+  });
+  const paymentIntents: PaymentIntent[] = (raw.paymentIntents ?? []).map((i: any) => {
+    if (i.destinationIban) return i;
+    migrated = true;
+    // Intents from before per-transaction destinations were pinned to the
+    // merchant's only account.
+    const m = merchants.find((x) => x.id === i.merchantId);
+    return { ...i, destinationIban: m?.settlementIbans[0] ?? "" };
+  });
+  db = { merchants, paymentIntents };
+  if (migrated) persist();
 }
 
 function persist(): void {

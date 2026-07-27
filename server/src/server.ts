@@ -15,6 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   attachTransfer,
+  clientSecretMatches,
   createIntent,
   exchangeCode,
   isIntentExpired,
@@ -151,9 +152,70 @@ app.post(
 // /api/checkout/* at all. They are declared before the proxy so they are
 // answered locally rather than forwarded.
 
-// Merchant handoff: validate the client + redirect_uri, create a payment
-// intent, and send the user to the checkout UI. Returns JSON to API callers
-// (tests, merchant backends), redirects a browser.
+/**
+ * Back channel: the merchant POSTs the payment details with its client secret
+ * and gets an intent id, then redirects the user to the returned URL.
+ *
+ * This exists so a merchant can name WHICH of its settlement accounts to be
+ * paid into. `client_id` is public and the front-channel GET below needs no
+ * secret, so a destination chosen in a URL would let anyone who has seen a
+ * checkout link mint one that looks like the merchant and pays an account of
+ * their choosing. Authenticating the call is what makes a per-transaction
+ * destination safe; the allowlist is what keeps it safe if the secret leaks.
+ */
+app.post(
+  "/api/checkout/intents",
+  wrap(async (req, res) => {
+    const b = req.body ?? {};
+    const merchant = b.client_id ? store.findMerchantByClientId(String(b.client_id)) : undefined;
+    // Same error for unknown client and wrong secret: the back channel should
+    // not confirm which client ids exist.
+    if (!merchant || !clientSecretMatches(merchant, b.client_secret)) {
+      return res.status(401).json({ error: "bad client credentials" });
+    }
+    if (!b.redirect_uri || !redirectAllowed(merchant, String(b.redirect_uri))) {
+      return res.status(400).json({ error: "redirect_uri not allowed for this client" });
+    }
+    const amountEur = Number(b.amount);
+    if (!(amountEur > 0)) return res.status(400).json({ error: "positive amount required" });
+    if (!b.code_challenge || (b.code_challenge_method ?? "S256") !== "S256") {
+      return res.status(400).json({ error: "S256 code_challenge required" });
+    }
+    const reference = String(b.reference ?? "");
+    // The reference is echoed to the merchant and is destined for the SEPA
+    // remittance field, which is 140 characters. Refuse rather than silently
+    // truncate the thing they reconcile on.
+    if (reference.length > 140) {
+      return res.status(400).json({ error: "reference must be 140 characters or fewer" });
+    }
+    let intent;
+    try {
+      intent = createIntent(merchant, {
+        amountEur,
+        reference,
+        redirectUri: String(b.redirect_uri),
+        state: String(b.state ?? ""),
+        codeChallenge: String(b.code_challenge),
+        destinationIban: b.destination_iban ? String(b.destination_iban) : undefined,
+      });
+    } catch (e: any) {
+      return res.status(400).json({ error: String(e?.message ?? e) });
+    }
+    res.status(201).json({
+      intentId: intent.id,
+      checkoutUrl: `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`,
+      merchant: merchant.name,
+      amountEur: intent.amountEur,
+      destinationIban: intent.destinationIban,
+      reference: intent.reference,
+      expiresAt: new Date(Date.parse(intent.createdAt) + 15 * 60_000).toISOString(),
+    });
+  }),
+);
+
+// Front channel: unauthenticated GET, kept for the simple case where the
+// merchant is paid into its default account. Deliberately cannot choose a
+// destination — see the back channel above.
 app.get(
   "/api/checkout/authorize",
   wrap(async (req, res) => {
@@ -167,6 +229,16 @@ app.get(
     if (!(amountEur > 0)) return res.status(400).json({ error: "positive amount required" });
     if (!q.code_challenge || (q.code_challenge_method ?? "S256") !== "S256") {
       return res.status(400).json({ error: "S256 code_challenge required" });
+    }
+    if (q.destination_iban) {
+      return res.status(400).json({
+        error:
+          "destination_iban cannot be set on the unauthenticated authorize URL — " +
+          "use POST /api/checkout/intents with your client secret",
+      });
+    }
+    if ((q.reference ?? "").length > 140) {
+      return res.status(400).json({ error: "reference must be 140 characters or fewer" });
     }
     const intent = createIntent(merchant, {
       amountEur,
@@ -197,7 +269,10 @@ app.get(
     res.json({
       ...statusView(intent),
       merchant: merchant?.name,
-      merchantIban: merchant?.ibanTarget,
+      // The account this intent pays, not the merchant's whole allowlist: the
+      // page shows it to the user and folds it into the signed destination
+      // commitment, so it must be the one pinned at creation.
+      merchantIban: intent.destinationIban,
       expired: isIntentExpired(intent),
     });
   }),
@@ -222,15 +297,24 @@ app.post(
       return res.status(400).json({ error: "transferId required" });
     }
     let transfer: CoreTransfer;
+    let payerName: string | undefined;
     try {
       transfer = await core<CoreTransfer>(`/api/transfers/${encodeURIComponent(transferId)}`, {
         sessionToken: token,
       });
+      // The merchant is granted the payer's legal name so it can evidence a
+      // first-party top-up. Read with the CALLER's session, so we can only ever
+      // learn the name of the person actually completing this checkout.
+      const payer = await core<{ name?: string }>(
+        `/api/users/${encodeURIComponent(transfer.userId)}`,
+        { sessionToken: token },
+      );
+      payerName = typeof payer?.name === "string" ? payer.name : undefined;
     } catch (err) {
       return relayCoreError(err, res);
     }
     try {
-      res.json(attachTransfer(intent, transfer.userId, transfer));
+      res.json(attachTransfer(intent, transfer.userId, transfer, payerName));
     } catch (e: any) {
       res.status(400).json({ error: String(e?.message ?? e) });
     }

@@ -105,6 +105,8 @@ try {
         // Its own store, so a test run cannot disturb merchants or intents a
         // local demo is using.
         CHECKOUT_DB_PATH: TEST_DB,
+        // Fixed, so the payer subject assertions below are reproducible.
+        CHECKOUT_SUBJECT_SECRET: "test-subject-secret-do-not-use-anywhere-real",
       },
     }),
   );
@@ -135,26 +137,72 @@ try {
     "the core has no checkout routes left to forward to",
   );
 
-  console.log("4/9 merchant starts a checkout (PKCE)…");
+  console.log("4/9 merchant starts a checkout (back channel, PKCE)…");
   const codeVerifier = randomBytes(48).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
   const state = randomBytes(8).toString("hex");
-  const authz = await svc(
-    `/api/checkout/authorize?client_id=demo-merchant&amount=${AMOUNT}&reference=mony-user-new` +
-      `&redirect_uri=${encodeURIComponent("https://mony.example/callback")}&state=${state}` +
-      `&code_challenge=${codeChallenge}&code_challenge_method=S256`,
+  const REDIRECT = "https://mony.example/callback";
+  const CLIENT = { client_id: "demo-merchant", client_secret: "demo-secret" };
+  // The demo merchant registers two settlement accounts; name the second, so
+  // the test proves the payment lands where the merchant asked rather than in
+  // the default.
+  const SECOND_IBAN = "DE02120300000000202051";
+
+  // A destination is only selectable on the authenticated back channel.
+  await assert.rejects(
+    () =>
+      svc(
+        `/api/checkout/authorize?client_id=demo-merchant&amount=${AMOUNT}` +
+          `&redirect_uri=${encodeURIComponent(REDIRECT)}&code_challenge=${codeChallenge}` +
+          `&destination_iban=${SECOND_IBAN}`,
+      ),
+    /client secret/,
+    "front-channel authorize refuses to pick a destination",
   );
+  await assert.rejects(
+    () => svc("/api/checkout/intents", { ...CLIENT, client_secret: "wrong", amount: AMOUNT, redirect_uri: REDIRECT, code_challenge: codeChallenge }),
+    /client credentials/,
+    "back channel needs the client secret",
+  );
+  // An account the merchant has not registered cannot be paid, even with a
+  // valid secret — the allowlist is what survives a leaked credential.
+  await assert.rejects(
+    () =>
+      svc("/api/checkout/intents", {
+        ...CLIENT,
+        amount: AMOUNT,
+        redirect_uri: REDIRECT,
+        code_challenge: codeChallenge,
+        destination_iban: "DE89370400440532013001",
+      }),
+    /not a registered settlement account/,
+    "unregistered destination refused",
+  );
+
+  const authz = await svc("/api/checkout/intents", {
+    ...CLIENT,
+    amount: AMOUNT,
+    reference: "mony-user-new",
+    redirect_uri: REDIRECT,
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    destination_iban: SECOND_IBAN,
+  });
   assert.ok(
     String(authz.checkoutUrl).startsWith(BFF),
     `checkoutUrl is absolute and points at this service, got ${authz.checkoutUrl}`,
   );
+  assert.equal(authz.destinationIban, SECOND_IBAN, "the named settlement account was pinned");
   const intentId = authz.intentId as string;
   assert.ok(intentId, "intent created");
 
   // The checkout page reads the intent through this service.
   const intent = await svc(`/api/checkout/intents/${intentId}`);
   assert.equal(intent.amountEur, AMOUNT);
-  assert.ok(intent.merchantIban, "merchant IBAN visible to the checkout page");
+  assert.equal(intent.merchantIban, SECOND_IBAN, "the page is shown the account this intent pays");
+  // The page's view is unauthenticated — it must never carry payer identity.
+  assert.equal(intent.payer, undefined, "public intent view discloses no payer");
 
   console.log("5/9 new user creates an account…");
   const user = await svc("/api/users", { name: "First Timer", country: "DE", email: "first@example.com" });
@@ -254,6 +302,10 @@ try {
   assert.equal(settled.status, "PAID", `expected PAID, got ${settled.status}`);
   assert.equal(settled.amountEur, AMOUNT);
   assert.equal(settled.reference, "mony-user-new", "merchant reference preserved");
+  assert.equal(settled.destinationIban, SECOND_IBAN, "settled into the account the merchant named");
+  assert.ok(settled.payer?.sub, "merchant gets a payer subject");
+  assert.notEqual(settled.payer.sub, user.id, "the subject is not the raw user id");
+  assert.equal(settled.payer.name, "First Timer", "merchant gets the payer's legal name");
 
   // The code is one-time: a replay after the exchange must not mint a second
   // status token.
