@@ -1,8 +1,8 @@
 # Pay with Zold — checkout service
 
-Repo: `Zoldenburg-me/pay-with-zold`. The directory on disk is `zold-checkout`,
-and the main repo's CLAUDE.md calls this "the checkout-service repo" — same
-thing. Zoldenburg is the company brand, Zold the consumer app.
+Repo: `tonyzil/pay-with-zold`, alongside `tonyzil/transF`. The directory on disk
+is `zold-checkout`, and the main repo's CLAUDE.md calls this "the
+checkout-service repo" — same thing.
 
 A hosted checkout page where someone who has never heard of Zold can create an
 account and pay a merchant without leaving the flow, and where an existing user
