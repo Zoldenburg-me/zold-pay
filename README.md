@@ -1,5 +1,15 @@
 # Pay with Zold — checkout service
 
+> **Status, September 2026.** The consumer-facing "pay by link" product now
+> lives in the core repo as **payment requests** (`/pay/<handle>/<code>`, plus
+> a Shopify payments app on the same requests) — see the core CLAUDE.md
+> section "Payment links + Shopify". This service is the merchant OAuth/PKCE
+> handoff and was written against a July 2026 core API; the core has since
+> replaced RemitVault with user-signed execution and made Monerium the identity
+> provider, so the flow below needs re-verifying before it is pointed at a
+> current core. It has not been retired: a partner that needs a code exchange
+> (the Mony shape) is still what this half is for.
+
 Repo: `tonyzil/pay-with-zold`, alongside `tonyzil/transF`. The directory on disk
 is `zold-checkout`, and the main repo's CLAUDE.md calls this "the
 checkout-service repo" — same thing.
