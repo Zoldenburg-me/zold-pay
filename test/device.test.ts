@@ -59,6 +59,18 @@ describe("device key: EIP-712 and signing (no PRF authenticator)", () => {
     assert.match(address, /^0x[0-9a-f]{40}$/);
   });
 
+  it("in strict mode, refuses to mint a key the passkey cannot protect, and stores nothing", async () => {
+    slots.clear();
+    await assert.rejects(() => dev.createKey("cred-none", { requirePrf: true }), /PRF/);
+    assert.equal(dev.keyStatus().present, false);
+  });
+
+  it("in strict mode, never mints an unprotected key just to report an address", async () => {
+    slots.clear();
+    await assert.rejects(() => dev.deviceAddress("cred-none", { requirePrf: true }), /PRF/);
+    assert.equal(dev.keyStatus().present, false);
+  });
+
   it("signs so that the signature recovers to the device address", async () => {
     const address = await dev.deviceAddress(null);
     const sig = await dev.signTypedData(TYPED_DATA, null);
@@ -123,5 +135,33 @@ describe("passkeyAssertion", () => {
     assert.equal(await dev.passkeyAssertion(undefined), undefined);
     assert.equal(await dev.passkeyAssertion({ credentialId: "x" }), undefined);
     assert.equal(await dev.passkeyAssertion({ challenge: "x" }), undefined);
+  });
+});
+
+describe("device key: a damaged record", () => {
+  it("is reported as present and unusable, and never written over", async () => {
+    slots.clear();
+    slots.set("zold-device-key", "{not json");
+    assert.deepEqual(dev.keyStatus(), { present: true, protection: null, damaged: true });
+    await assert.rejects(() => dev.createKey(null), /already/);
+    await assert.rejects(() => dev.deviceAddress(null), /damaged/);
+    assert.equal(slots.get("zold-device-key"), "{not json", "the record is left exactly as it was");
+  });
+
+  it("is replaced only when the caller says so (an account with no key bound yet)", async () => {
+    slots.clear();
+    slots.set("zold-device-key", "{not json");
+    const { address } = await dev.createKey(null, { replaceDamaged: true });
+    assert.match(address, /^0x[0-9a-f]{40}$/);
+    assert.equal(dev.keyStatus().damaged, undefined);
+  });
+
+  it("refuses to replace any key already stored", async () => {
+    slots.clear();
+    await dev.createKey(null);
+    const first = slots.get("zold-device-key");
+    await assert.rejects(() => dev.createKey(null), /already/);
+    await assert.rejects(() => dev.createKey(null, { replaceDamaged: true }), /already/, "a readable key is never replaced");
+    assert.equal(slots.get("zold-device-key"), first);
   });
 });

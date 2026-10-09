@@ -27,8 +27,6 @@ interface Rule {
  * users to; none of those routes are reachable through here.
  */
 const ALLOW: Rule[] = [
-  { method: "GET", pattern: "/api/health" },
-
   // Read back the signed-in user (balances, KYC state).
   { method: "GET", pattern: "/api/users/:id" },
   { method: "GET", pattern: "/api/users/:id/kyc" },
@@ -50,6 +48,9 @@ const ALLOW: Rule[] = [
 /**
  * Deliberately NOT proxied, so the reasoning survives the next person reading
  * the list above:
+ *   /api/health                 the core's own health output (versions,
+ *                               paths) is not the public's; /bff/health says
+ *                               only whether the core is reachable.
  *   /api/checkout/*             served by THIS service — it is the
  *                               authorization server. Nothing to forward.
  *   /api/kyc/review             operator token; approving KYC is not a

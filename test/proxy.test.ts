@@ -6,7 +6,6 @@ const { isAllowed } = await import("../server/src/proxy.js");
 
 describe("proxy allowlist: what an existing user needs", () => {
   const allowed: Array<[string, string]> = [
-    ["GET", "/api/health"],
     ["POST", "/api/webauthn/challenge"],
     ["POST", "/api/passkey/login"],
     ["GET", "/api/users/u_123"],
@@ -37,6 +36,7 @@ describe("proxy allowlist: what must stay unreachable", () => {
     ["PUT", "/api/transfers/t_1", "method not allowed"],
     ["GET", "/api/transfers", "no listing"],
     ["POST", "/api/checkout/token", "served locally, never forwarded"],
+    ["GET", "/api/health", "the core's health output is not the public's business; /bff/health answers locally"],
   ];
   for (const [method, path, why] of blocked) {
     it(`blocks ${method} ${path} (${why})`, () => assert.equal(isAllowed(method, path), false));

@@ -27,7 +27,7 @@ let garbageTransfer = false;
 let transferSeq = 0;
 const freshTransfer = () => `t${++transferSeq}`;
 
-let lastHealth: { url?: string; headers: Record<string, unknown> } | undefined;
+let lastRequest: { url?: string; headers: Record<string, unknown> } | undefined;
 let secretHits = 0;
 
 const coreStub: Server = createServer((req, res) => {
@@ -36,9 +36,10 @@ const coreStub: Server = createServer((req, res) => {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
   };
+  lastRequest = { url: req.url, headers: { ...req.headers } };
   if (req.url?.startsWith("/api/health")) {
-    lastHealth = { url: req.url, headers: { ...req.headers } };
-    return send(200, { ok: true });
+    // What a core might say about itself: none of it is for the public.
+    return send(200, { ok: true, version: "1.2.3", db: "/var/lib/zold/db.json", chainId: 8453 });
   }
   if (req.url === "/api/quotes") {
     res.writeHead(302, { location: "/secret" });
@@ -364,9 +365,9 @@ describe("the unauthenticated front channel", () => {
 
 describe("proxy hygiene", () => {
   it("never forwards a client-supplied X-Forwarded-For or the query string", async () => {
-    await fetch(`${base}/api/health?debug=1`, { headers: { "x-forwarded-for": "6.6.6.6" } });
-    assert.equal(lastHealth?.url, "/api/health");
-    const xff = String(lastHealth?.headers["x-forwarded-for"] ?? "");
+    await fetch(`${base}/api/users/u1?debug=1`, { headers: { "x-forwarded-for": "6.6.6.6", authorization: `Bearer ${OWNER}` } });
+    assert.equal(lastRequest?.url, "/api/users/u1");
+    const xff = String(lastRequest?.headers["x-forwarded-for"] ?? "");
     assert.equal(xff.includes("6.6.6.6"), false, xff);
     assert.equal(xff, "127.0.0.1");
   });
@@ -440,5 +441,17 @@ describe("claiming a checkout before paying, over HTTP", () => {
     assert.equal(out.unattachedPayments.length, 1);
     assert.equal(out.unattachedPayments[0].amountEur, 25);
     assert.equal(out.unattachedPayments[0].reason, "duplicate");
+  });
+});
+
+describe("health", () => {
+  it("says only whether the core is reachable, never what the core says about itself", async () => {
+    const r = await call("/bff/health");
+    assert.equal(r.status, 200);
+    assert.deepEqual(await r.json(), { ok: true, core: { reachable: true } });
+  });
+
+  it("does not forward the core's own health endpoint", async () => {
+    assert.equal((await call("/api/health")).status, 404);
   });
 });

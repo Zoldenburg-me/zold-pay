@@ -114,6 +114,12 @@ const fmt = (n) => "€" + Number(n).toLocaleString("en", { minimumFractionDigit
    binding a key in the same browser would silently take the first person's key
    as their own spending authorizer, and either could then spend the other's balance. */
 const KEY_OWNER_SLOT = "zold-checkout-key-owner";
+const DAMAGED_KEY_REFUSAL =
+  "the spending key stored in this browser is damaged, so the checkout can't use it — pay in the Zold app";
+/* Every device.js call that could make a key makes it passkey-protected or not at all. */
+const STRICT_KEY = { requirePrf: true };
+const UNPROTECTED_KEY_REFUSAL =
+  "this browser holds your spending key unencrypted, which the checkout won't use — pay in the Zold app, or from a device whose passkey supports PRF";
 const SHARED_KEY_REFUSAL =
   "this browser already holds a spending key for a different Zold account — pay from your own device, or a private window";
 
@@ -382,7 +388,7 @@ async function keyBelongsToAnotherAccount() {
   // from an interrupted bind). Only treat it as this account's if the server says
   // this very address is the account's authorizer; never adopt an unknown key.
   if (!user.authorizerAddress) return true;
-  const addr = await dev.deviceAddress(credId());
+  const addr = await dev.deviceAddress(credId(), STRICT_KEY);
   return addr.toLowerCase() !== user.authorizerAddress.toLowerCase();
 }
 
@@ -390,19 +396,40 @@ async function keyBelongsToAnotherAccount() {
    browser and bind it as the account's authorizer, behind a passkey step-up.
    The server takes the first binding and refuses re-binding by anyone but the
    current device, so this establishes a key, never steals one. */
+/* A key present in this browser must be readable and passkey-protected. */
+function assertUsableKey(dev) {
+  const status = dev.keyStatus();
+  if (!status.present) return;
+  if (status.damaged) throw new Error(DAMAGED_KEY_REFUSAL);
+  if (status.protection !== "prf") throw new Error(UNPROTECTED_KEY_REFUSAL);
+}
+
 async function ensureDeviceKey() {
-  if (await keyBelongsToAnotherAccount()) throw new Error(SHARED_KEY_REFUSAL);
-  if (user.authorizerAddress) return;
   const dev = await deviceLib;
-  const { address, protection } = dev.keyStatus().present
-    ? { address: await dev.deviceAddress(credId()), protection: dev.keyStatus().protection }
-    : await dev.createKey(credId());
+  // A damaged record on an account with no key bound cannot be its key: replace it.
+  // With a key bound it may be that key, so it is refused (assertUsableKey).
+  const replaceDamaged = !!dev.keyStatus().damaged && !user.authorizerAddress;
+  if (replaceDamaged) {
+    const { address } = await dev.createKey(credId(), { ...STRICT_KEY, replaceDamaged: true });
+    return bindDeviceKey(address);
+  }
+  if (await keyBelongsToAnotherAccount()) throw new Error(SHARED_KEY_REFUSAL);
+  // The checkout never uses a spending key that sits unencrypted in the browser:
+  // anyone with this browser's storage could sign with it. Refused before any
+  // money can move, and never minted here (requirePrf).
+  assertUsableKey(dev);
+  if (user.authorizerAddress) return;
+  const { address } = dev.keyStatus().present
+    ? { address: await dev.deviceAddress(credId(), STRICT_KEY) }
+    : await dev.createKey(credId(), STRICT_KEY);
+  await bindDeviceKey(address);
+}
+
+/* Bind `address` as the account's spending key, behind a passkey step-up. */
+async function bindDeviceKey(address) {
   const updated = await api(`/api/users/${user.id}/authorizer`, { address, stepUp: await passkeyStepUp("authorizer.bind") });
   localStorage.setItem(KEY_OWNER_SLOT, user.id);
   if (updated.authorizerAddress) user = { ...user, authorizerAddress: updated.authorizerAddress };
-  if (protection !== "prf") {
-    showNote("Your spending key is stored unencrypted in this browser — this device's authenticator doesn't support the PRF extension.");
-  }
 }
 
 /* ---------- payment ---------- */
@@ -439,7 +466,9 @@ async function authorizePayment(quote) {
   if (!dev.keyStatus().present) {
     throw new Error("this browser has no spending key for your account — pay from the device you set Zold up on");
   }
-  const addr = await dev.deviceAddress(credId());
+  // Again, right before signing: another tab may have changed the key since.
+  assertUsableKey(dev);
+  const addr = await dev.deviceAddress(credId(), STRICT_KEY);
   if (created.authorization.authorizer.toLowerCase() !== addr.toLowerCase()) {
     throw new Error("your spending key was set up in a different browser — pay from that device, or open the Zold app to rotate it");
   }
