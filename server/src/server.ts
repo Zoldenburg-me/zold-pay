@@ -18,12 +18,14 @@ import {
   CoreResponseError,
   assertNoWildcardRedirects,
   attachTransfer,
+  claimIntent,
   clientSecretMatches,
   createIntent,
   exchangeCode,
   isIntentExpired,
   parseCoreTransfer,
   redirectAllowed,
+  releaseClaim,
   seedDemoMerchant,
   statusByToken,
   statusView,
@@ -256,6 +258,69 @@ app.get(
   }),
 );
 
+/**
+ * The page makes its claim token from 32 random bytes (43 base64url characters);
+ * anything shorter is not a secret worth holding a checkout with.
+ */
+const isClaimToken = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9_-]{43,128}$/.test(v);
+
+/** A refusal the caller may see, with its stable code and whether asking again can help. */
+const checkoutErrorBody = (e: CheckoutError) => ({
+  error: e.message,
+  ...(e.code ? { code: e.code } : {}),
+  ...(e.retryable ? { retryable: true } : {}),
+});
+
+// The page claims the checkout for its payer BEFORE it creates a core transfer,
+// so a second tab or device that loaded the same checkout cannot pay it too.
+// The session must belong to the payer named: the core answers the user read
+// with the caller's own session, and refuses anyone else's.
+app.post(
+  "/api/checkout/intents/:id/claim",
+  credentialLimit(),
+  wrap(async (req, res) => {
+    const token = bearer(req);
+    if (!token) return res.status(401).json({ error: "authorization required" });
+    const userId = req.body?.userId;
+    if (!isId(userId)) return res.status(400).json({ error: "userId required" });
+    const claimToken = req.body?.claimToken;
+    if (!isClaimToken(claimToken)) return res.status(400).json({ error: "claimToken required" });
+    try {
+      await core(`/api/users/${encodeURIComponent(userId)}`, { sessionToken: token });
+    } catch (err) {
+      return relayCoreError(err, res);
+    }
+    try {
+      // By id, after the await: the checkout may have been claimed meanwhile.
+      // claimIntent checks and writes with no await in between, which is what
+      // makes two simultaneous claims end with exactly one holder.
+      claimIntent(req.params.id, userId, claimToken);
+      res.json({ status: "PAYING" });
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(e.status).json(checkoutErrorBody(e));
+      throw e;
+    }
+  }),
+);
+
+// The paying tab gives the checkout back when its payment surely did not happen.
+// The claim token is the credential: only the tab that claimed holds it.
+app.post(
+  "/api/checkout/intents/:id/release",
+  credentialLimit(),
+  wrap(async (req, res) => {
+    const claimToken = req.body?.claimToken;
+    if (!isClaimToken(claimToken)) return res.status(400).json({ error: "claimToken required" });
+    try {
+      releaseClaim(req.params.id, claimToken);
+      res.status(204).end();
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(e.status).json(checkoutErrorBody(e));
+      throw e;
+    }
+  }),
+);
+
 // The user links the transfer they just authorized into the merchant's IBAN,
 // minting the one-time code and the redirect back. The transfer is read back
 // from the core API with the caller's own bearer: a transfer another user owns
@@ -287,9 +352,7 @@ app.post(
       // By id, not the record fetched above: it can be stale after the awaits.
       res.json(attachTransfer(intent.id, transfer, payerName));
     } catch (e) {
-      if (e instanceof CheckoutError) {
-        return res.status(e.status).json({ error: e.message, ...(e.retryable ? { retryable: true } : {}) });
-      }
+      if (e instanceof CheckoutError) return res.status(e.status).json(checkoutErrorBody(e));
       throw e;
     }
   }),

@@ -158,7 +158,11 @@ The `demo-merchant` client is seeded only when `ALLOW_DEV_SHORTCUTS=1`. There is
 5. **Device key** — generated in this browser by `device.js`, bound via
    `POST /api/users/:id/authorizer` with a step-up assertion.
 6. **Funding** — the honest step. See below.
-7. **Pay** — two quotes (the first reveals the flat fee, the second sizes the
+7. **Claim** — `POST /api/checkout/intents/:id/claim` moves the checkout to
+   `PAYING` for this payer before any transfer exists. A second tab or device
+   that loaded the same checkout is refused here (`payment_in_progress`) instead
+   of paying it again.
+8. **Pay** — two quotes (the first reveals the flat fee, the second sizes the
    send so the merchant receives exactly the intent amount), create the
    transfer, verify the terms, sign, `POST /api/transfers/:id/authorize`, then
    `POST /api/checkout/intents/:id/attach` and redirect back with the code.
@@ -295,6 +299,16 @@ secret returns:
 }
 ```
 
+- **`status`** can also be `PAYING` while a payer is part-way through.
+- **`unattachedPayments`** (only present when non-empty) lists settled payments
+  made for this checkout that could not be attached to it, each with
+  `transferId`, `amountEur`, `reason` (`duplicate`: it was already paid;
+  `claimed_by_another`: someone else was paying it; `late`: it had closed) and
+  the transfer's `state` and `recordedAt` when recorded. **Check the money
+  arrived before refunding it**: `PAYOUT_SUBMITTED` can still fail. Refund with a
+  transfer you sign; we cannot recall a SEPA payout. `unattachedPaymentsTruncated`
+  means more arrived than are kept (100); Zold support has the rest. A checkout
+  can carry these and still be unpaid, if its own payer never finished.
 - **`reference`** is echoed back verbatim, so the merchant maps the payment to
   its own user and transaction.
 - **`payer.sub`** is `HMAC(CHECKOUT_SUBJECT_SECRET, merchantId + userId)` —
@@ -459,6 +473,53 @@ without a user session.
 merchant's own reference plus a part unique to the checkout (`ZP` and 12 hex
 characters), so a payment can only ever be matched to the checkout it was made
 for. The merchant's part is therefore limited to 120 characters.
+
+**One payment per checkout, claimed before money moves.** Two tabs or devices
+that both load an open checkout could each authorize a transfer; the first
+attach would win and the second payment would still reach the merchant. So the
+page claims the checkout (`PENDING → PAYING`) before it creates a transfer, and
+only the claim holder pays. The page makes the
+claim token (32 random bytes) and keeps it before asking, so a claim whose answer
+was lost is released or resumed with the same token instead of being orphaned.
+The claim does not time out while the checkout can still be attached: a quiet tab
+may be mid-payment. The holder releases it only when the payment surely did not
+happen (passkey cancelled, the core refused the authorization); an authorization
+with no clear answer keeps the claim and the tab switches to confirming that
+transfer. The holder cannot resume a claim once the checkout is past its 15
+minutes. A tab that crashed mid-payment leaves the checkout `PAYING`: it can no
+longer be paid after 15 minutes, stops counting toward the pending cap, and is
+swept after a day; the merchant starts a new one. A duplicated browser tab copies
+sessionStorage, claim token included, so the page also holds a Web Lock per
+checkout: a copy cannot resume the claim while the original tab is open. A
+browser without Web Locks, or one that refuses them, is told to use another
+browser rather than trusted.
+Only these answers to the authorization release the claim: 400, 401, 403, 404,
+429. A conflict, a timeout or any 5xx keeps it. Claimed checkouts are kept for a
+day (not swept after an hour), since a payment may still be on its way.
+
+**A payment that cannot be attached is recorded, not lost.** A second payment
+(an older page, the Zold app, a payer outside this page) or one by someone who
+did not hold the claim is refused with `duplicate_payment`; one that arrives
+after the checkout closed is refused with `late_payment`. Either way it is
+recorded on the checkout once (`unattachedPayments`, see *Getting the result*),
+the payer's page says it is recorded and will be refunded, and the checkout is
+never swept while it holds one. Only a transfer made for this checkout (account,
+amount and reference all match) that has settled (`PAYOUT_SUBMITTED` or `PAID`)
+is recorded; one still in flight gets a retryable `not_settled`, so a draft can
+never be refunded. A late payment on a checkout whose merchant never exchanged a
+code is visible to support and on the merchant's own statement (it carries the
+checkout's reference), not through the status API.
+
+**Accepted for now.** Anyone with a Zold session and the checkout link can claim
+it and hold it until it expires (the link is an unguessable id given to the
+payer, and the merchant can start a new checkout). Attach checks the claim
+holder by user, not by claim token, so a client that skips the claim can still
+pay; the second payment is then caught as a duplicate, not prevented.
+
+**Refusals carry a stable `code`** next to the human `error`: `unknown_checkout`,
+`checkout_closed`, `checkout_expired`, `checkout_completed`,
+`payment_in_progress`, `not_claim_holder`, `duplicate_payment`, `late_payment`,
+`not_settled`.
 
 **Attach is retryable.** If the response to `/attach` is lost after the payer was
 debited, the page asks again for the same transfer and gets a fresh code (the

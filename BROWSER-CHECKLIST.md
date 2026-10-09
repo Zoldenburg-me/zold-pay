@@ -99,3 +99,27 @@ stubs; this checks it for real, once.
 - **Already paid.** Reload a completed intent — "Already paid".
 - **Cancelled prompt.** Dismiss any passkey prompt: an error is shown, the button
   comes back, and nothing is sent to the merchant.
+- **Cancelled prompt releases the checkout.** After cancelling, open the link in
+  a second tab: it must show the pay form, not "Payment in progress".
+
+## One payment per checkout (needs a real browser and passkey)
+
+- **Two tabs.** Open the same open checkout in two tabs. Press pay in tab A and
+  stop at the passkey prompt. Press pay in tab B: it must say "already being paid
+  in another window or device" before any quote or transfer. Finish in tab A.
+- **Duplicated tab.** Start paying in tab A, then use the browser's "Duplicate
+  tab" on it. The copy must say "Payment in progress" and offer no pay form.
+- **Two devices.** Same as two tabs, with the second on a phone signed in to the
+  same account, and again with a different account.
+- **Reload mid-payment.** Reload tab A after the claim but before the passkey: it
+  must offer the pay form again (same tab), and paying must complete once.
+- **Unclear authorization.** Block the network right after the passkey prompts
+  (devtools offline): the page must say "do not pay again" and offer only
+  "Confirm with merchant"; a second tab must still say "Payment in progress".
+- **Second payment recorded.** Pay the same checkout from the Zold app after it
+  was paid here: the app's transfer goes through, and if its page attaches it,
+  it shows "Payment recorded … the merchant will refund it". The merchant's
+  status shows it under `unattachedPayments`.
+- **Embedded or private window.** Open the checkout inside an iframe or a
+  browser that refuses Web Locks: pressing pay must say to use an up-to-date
+  browser, and nothing is created.
