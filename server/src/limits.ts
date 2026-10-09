@@ -1,5 +1,6 @@
 /**
- * Fixed-window, in-memory rate limiter keyed on the client address.
+ * Fixed-window, in-memory rate limiter, keyed on the client address unless told
+ * otherwise (a merchant's client id, say).
  *
  * One process, so no shared state: fine for a single checkout instance, and an
  * honest limit to state if this is ever scaled out. IPv6 clients are keyed on
@@ -12,7 +13,8 @@ export interface RateLimitOptions {
   windowMs: number;
   max: number;
   now?: () => number;
-  keyOf?: (req: express.Request) => string;
+  /** The bucket for a request; undefined leaves the request to the other limits. */
+  keyOf?: (req: express.Request) => string | undefined;
 }
 
 function expandV6(ip: string): string[] {
@@ -47,6 +49,7 @@ export function createRateLimiter(opts: RateLimitOptions): express.RequestHandle
       nextSweep = t + opts.windowMs;
     }
     const key = keyOf(req);
+    if (key === undefined) return next();
     let entry = hits.get(key);
     if (!entry || entry.resetAt <= t) {
       entry = { count: 0, resetAt: t + opts.windowMs };

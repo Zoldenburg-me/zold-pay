@@ -9,15 +9,20 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadEnvFileStrict } from "./env-file.js";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-// Load .env if present (Node 20.12+ built-in; no dotenv dependency), same as
-// the core app. Secrets stay out of the repo — see .env.example.
+// Load .env if present (Node's own parser; no dotenv dependency), same as
+// the core app. Secrets stay out of the repo — see .env.example. No file means
+// the defaults apply; a file that cannot be read, or has a line the loader would
+// skip or misread, stops the service with one line naming the file and the
+// line (see env-file.ts). CHECKOUT_ENV_FILE points it elsewhere, e.g. in tests.
 try {
-  process.loadEnvFile(path.join(ROOT, ".env"));
-} catch {
-  // no .env — defaults apply
+  loadEnvFileStrict(process.env.CHECKOUT_ENV_FILE || path.join(ROOT, ".env"));
+} catch (e) {
+  console.error(`checkout: ${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
 }
 
 const bool = (v: string | undefined, dflt = false) =>
@@ -31,14 +36,15 @@ const bool = (v: string | undefined, dflt = false) =>
 const num = (name: string, v: string | undefined, dflt: number): number => {
   if (v === undefined || v === "") return dflt;
   const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number, got "${v}"`);
+  // The setting is named, its value is not: config errors end up in logs.
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number`);
   return n;
 };
 
 const proxyHops = (v: string | undefined): number | undefined => {
   if (v === undefined || v === "") return undefined;
   const n = Number(v);
-  if (!Number.isInteger(n) || n < 0) throw new Error(`TRUSTED_PROXY_HOPS must be a whole number of 0 or more, got "${v}"`);
+  if (!Number.isInteger(n) || n < 0) throw new Error("TRUSTED_PROXY_HOPS must be a whole number of 0 or more");
   return n;
 };
 
@@ -71,7 +77,7 @@ export interface Config {
   trustedProxyHops?: number;
   /** Largest checkout amount accepted, in EUR. */
   maxAmountEur: number;
-  rateLimit: { windowMs: number; general: number; credential: number };
+  rateLimit: { windowMs: number; general: number; credential: number; client: number };
 }
 
 const publicOrigin = (process.env.CHECKOUT_PUBLIC_ORIGIN ?? "http://localhost:3100").replace(/\/+$/, "");
@@ -135,6 +141,8 @@ export const CONFIG: Config = {
     // Per client address, per window. The credential bucket applies per route.
     general: num("RATE_LIMIT_GENERAL", process.env.RATE_LIMIT_GENERAL, 300),
     credential: num("RATE_LIMIT_CREDENTIAL", process.env.RATE_LIMIT_CREDENTIAL, 20),
+    // Per merchant, across every address: front-channel checkouts started per window.
+    client: num("RATE_LIMIT_CLIENT", process.env.RATE_LIMIT_CLIENT, 60),
   },
 };
 
