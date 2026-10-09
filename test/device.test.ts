@@ -148,11 +148,20 @@ describe("device key: a damaged record", () => {
     assert.equal(slots.get("zold-device-key"), "{not json", "the record is left exactly as it was");
   });
 
+  it("is replaced only when the caller says so (an account with no key bound yet)", async () => {
+    slots.clear();
+    slots.set("zold-device-key", "{not json");
+    const { address } = await dev.createKey(null, { replaceDamaged: true });
+    assert.match(address, /^0x[0-9a-f]{40}$/);
+    assert.equal(dev.keyStatus().damaged, undefined);
+  });
+
   it("refuses to replace any key already stored", async () => {
     slots.clear();
     await dev.createKey(null);
     const first = slots.get("zold-device-key");
     await assert.rejects(() => dev.createKey(null), /already/);
+    await assert.rejects(() => dev.createKey(null, { replaceDamaged: true }), /already/, "a readable key is never replaced");
     assert.equal(slots.get("zold-device-key"), first);
   });
 });

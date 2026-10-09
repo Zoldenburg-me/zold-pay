@@ -220,14 +220,19 @@ export function keyStatus() {
  * supports PRF. Returns the address plus how the key ended up protected, so
  * the caller can tell the user the truth.
  *
- * `requirePrf` (the checkout sets it) refuses instead of storing a key the
- * passkey cannot protect: nothing is written, and the error says why. The
- * default keeps the core's behaviour.
+ * `requirePrf` refuses instead of storing a key the passkey cannot protect:
+ * nothing is written, and the error says why.
+ *
+ * Never writes over a stored key: it may be the account's bound authorizer,
+ * and only the current authorizer can rotate it. The one exception is a
+ * damaged record when the caller knows the account has no key bound yet
+ * (`replaceDamaged`): then it cannot be anyone's usable key.
  */
-export async function createKey(credentialId, { requirePrf = false } = {}) {
-  // Never over an existing key, readable or not: it may be the account's bound
-  // authorizer, and only the current authorizer can rotate it.
-  if (readSlot()) throw new Error("a spending key is already stored in this browser; it is not replaced");
+export async function createKey(credentialId, { requirePrf = false, replaceDamaged = false } = {}) {
+  const existing = readSlot();
+  if (existing && !(existing.damaged && replaceDamaged)) {
+    throw new Error("a spending key is already stored in this browser; it is not replaced");
+  }
   const privHex = freshPrivateKey();
   const secret = await prfSecret(credentialId);
   if (secret) {

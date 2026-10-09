@@ -573,3 +573,26 @@ describe("the spending key, checked again", () => {
     assert.match(page.el("err").textContent, /unencrypted/);
   });
 });
+
+describe("a damaged key record on an account with no key bound", () => {
+  it("is replaced with a new, passkey-protected key, since it cannot be the account's key", async () => {
+    let asked: { requirePrf?: unknown; replaceDamaged?: unknown } | undefined;
+    const happy = happyRoute();
+    const { authorizerAddress: _bound, ...unbound } = USER;
+    const page = boot({
+      route: (m, p, b, c) =>
+        p === "/api/users/u1" || p === "/api/passkey/login" ? [200, unbound]
+        : p === "/api/users/u1/authorizer" ? [200, { authorizerAddress: "0xabc" }]
+        : happy(m, p, b, c),
+      device: {
+        keyStatus: () => (asked ? { present: true, protection: "prf" } : { present: true, protection: null, damaged: true }),
+        createKey: async (_cred: string, opts: typeof asked) => ((asked = opts), { address: "0xabc", protection: "prf" }),
+      },
+    });
+    await settle();
+    await click(page);
+    assert.equal(asked?.replaceDamaged, true);
+    assert.equal(asked?.requirePrf, true);
+    assert.equal(count(page, "/api/users/u1/authorizer"), 1);
+  });
+});
