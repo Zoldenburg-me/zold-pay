@@ -276,7 +276,8 @@ signed nor makes a newly-added account payable for an intent that never named
 it. Attach validates the transfer against that pinned value.
 
 There is no merchant onboarding UI — registering a merchant means adding a row
-to `data/checkout.json`, and `clientSecret` is stored there in plaintext.
+to `data/checkout.json`. The client secret is stored there as a SHA-256 hash
+only; the plaintext is shown once, when issued.
 
 ### Getting the result
 
@@ -451,8 +452,18 @@ real SEPA payout an intent would sit at `AUTHORIZED` forever. The fix is
 core-side — a checkout webhook, or a service credential that can read a transfer
 without a user session.
 
-**No merchant onboarding**, and `clientSecret` is stored in plaintext in
-`data/checkout.json`. Fine for a demo, not for a partner.
+**No merchant onboarding.** Merchants are added by editing `data/checkout.json`
+(secrets are stored as hashes, not plaintext).
+
+**A checkout's payment carries its own reference.** The SEPA reference is the
+merchant's own reference plus a part unique to the checkout (`ZP` and 12 hex
+characters), so a payment can only ever be matched to the checkout it was made
+for. The merchant's part is therefore limited to 120 characters.
+
+**Attach is retryable.** If the response to `/attach` is lost after the payer was
+debited, the page asks again for the same transfer and gets a fresh code (the
+earlier one stops working) until the merchant has exchanged it. A payment that
+finishes up to 10 minutes after the checkout's 15-minute window is still accepted.
 
 ---
 
@@ -479,7 +490,7 @@ server/src/server.ts    checkout routes, /bff/* routes, proxy mount, static page
 web/checkout.html       the checkout + onboarding page
 web/device.js           VERBATIM copy from the main repo — see below
 web/vendor/             VERBATIM copy (noble secp256k1 + hashes)
-scripts/onboard-test.ts headless orchestration test
+scripts/harness-smoke.ts  wiring check against a local core (refuses real money)
 ```
 
 `device.js` and `vendor/` are copied **verbatim** and must stay that way. The
