@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -260,13 +260,14 @@ describe("recovering from a lost attach", () => {
     const { intentId } = await newIntent();
     const transferId = freshTransfer();
     const code = await codeFrom(await attachTo(intentId, transferId));
+    // A second payment made for this checkout: refused, and recorded for a refund.
     const other = await attachTo(intentId, freshTransfer());
-    assert.equal(other.status, 400);
-    assert.equal(((await other.json()) as any).error, "intent already authorized");
+    assert.equal(other.status, 409);
+    assert.equal(((await other.json()) as any).code, "duplicate_payment");
     assert.equal((await exchange(code)).status, 200);
     const late = await attachTo(intentId, transferId);
     assert.equal(late.status, 400);
-    assert.equal(((await late.json()) as any).error, "checkout already completed");
+    assert.equal(((await late.json()) as any).code, "checkout_completed");
   });
 
   it("does not fail a funded attach just because the payer's name could not be looked up", async () => {
@@ -374,5 +375,70 @@ describe("proxy hygiene", () => {
     const r = await call("/api/quotes", { json: {}, token: OWNER });
     assert.equal(r.status, 302);
     assert.equal(secretHits, 0);
+  });
+});
+
+describe("claiming a checkout before paying, over HTTP", () => {
+  const newClaimToken = () => randomBytes(32).toString("base64url");
+  // null means no session at all (undefined would fall back to the default).
+  const claim = (intentId: string, claimToken = newClaimToken(), token: string | null = OWNER, userId = "u1") =>
+    call(`/api/checkout/intents/${intentId}/claim`, { json: { userId, claimToken }, token: token ?? undefined });
+  const release = (intentId: string, claimToken: unknown) =>
+    call(`/api/checkout/intents/${intentId}/release`, { json: { claimToken } });
+  const json = async (r: Response) => (await r.json()) as { code?: string; [k: string]: unknown };
+
+  it("needs a session, a page-made token, and only for the payer that session belongs to", async () => {
+    const { intentId } = await newIntent();
+    assert.equal((await claim(intentId, newClaimToken(), null)).status, 401);
+    assert.equal((await claim(intentId, newClaimToken(), STRANGER)).status, 403, "the core says this session is not u1");
+    assert.equal((await claim(intentId, newClaimToken(), OWNER, "../admin")).status, 400);
+    assert.equal((await claim(intentId, "short")).status, 400, "a guessable token cannot hold a checkout");
+    assert.equal((await call(`/api/checkout/intents/${intentId}/claim`, { json: { userId: "u1" }, token: OWNER })).status, 400);
+  });
+
+  it("lets one tab claim, refuses the second with a code, and lets the first retry with its token", async () => {
+    const { intentId } = await newIntent();
+    const mine = newClaimToken();
+    assert.equal((await claim(intentId, mine)).status, 200);
+    const second = await claim(intentId);
+    assert.equal(second.status, 409);
+    assert.equal((await json(second)).code, "payment_in_progress");
+    // The first answer was lost: the same token claims again.
+    assert.equal((await claim(intentId, mine)).status, 200);
+    const page = await json(await call(`/api/checkout/intents/${intentId}`));
+    assert.equal(page.status, "PAYING");
+  });
+
+  it("gives the checkout to exactly one of two tabs that claim it at the same moment", async () => {
+    const { intentId } = await newIntent();
+    const replies = await Promise.all([claim(intentId), claim(intentId)]);
+    assert.deepEqual(replies.map((r) => r.status).sort(), [200, 409]);
+    const loser = replies.find((r) => r.status === 409)!;
+    assert.equal((await json(loser)).code, "payment_in_progress");
+  });
+
+  it("releases only for the claim holder, after which the checkout can be claimed again", async () => {
+    const { intentId } = await newIntent();
+    const mine = newClaimToken();
+    await claim(intentId, mine);
+    const wrong = await release(intentId, newClaimToken());
+    assert.equal(wrong.status, 403);
+    assert.equal((await json(wrong)).code, "not_claim_holder");
+    assert.equal((await release(intentId, 42)).status, 400);
+    assert.equal((await release(intentId, mine)).status, 204);
+    assert.equal((await claim(intentId)).status, 200);
+  });
+
+  it("records a second payment for a paid checkout and shows it to the merchant", async () => {
+    const { intentId } = await newIntent();
+    await claim(intentId);
+    const code = await codeFrom(await attachTo(intentId));
+    const dup = await attachTo(intentId);
+    assert.equal(dup.status, 409);
+    assert.equal((await json(dup)).code, "duplicate_payment");
+    const out = (await (await exchange(code)).json()) as { unattachedPayments: { amountEur: number; reason: string }[] };
+    assert.equal(out.unattachedPayments.length, 1);
+    assert.equal(out.unattachedPayments[0].amountEur, 25);
+    assert.equal(out.unattachedPayments[0].reason, "duplicate");
   });
 });

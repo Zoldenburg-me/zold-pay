@@ -15,7 +15,8 @@ const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../web")
 const html = readFileSync(path.join(WEB, "checkout.html"), "utf8");
 const script = [...html.matchAll(/<script(?![^>]*\bsrc=)(?![^>]*importmap)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
 
-type Reply = [number, unknown];
+/** A reply, or "network" for a request that never got an answer. */
+type Reply = [number, unknown] | "network";
 type Call = { method: string; path: string; body: any };
 type Router = (method: string, path: string, body: any, calls: Call[]) => Reply;
 
@@ -55,7 +56,13 @@ const INTENT = {
   reference: "order-1", transferReference: "order-1 ZP0123456789AB", expired: false,
 };
 
-function boot(opts: { route: Router; session?: boolean; stored?: Record<string, string> }) {
+/** Web Locks: free, held by another tab of this browser, missing, or refusing (e.g. a sandboxed frame). */
+type LockMode = "free" | "busy" | "absent" | "rejects";
+
+function boot(opts: { route: Router; session?: boolean; stored?: Record<string, string>; device?: Record<string, unknown>; locks?: LockMode }) {
+  const lockReleases: string[] = [];
+  const lockMode = opts.locks ?? "free";
+  let randomSeq = 0;
   const els: Record<string, Fake> = {};
   const calls: Call[] = [];
   const storage = (init: Record<string, string> = {}) => {
@@ -78,7 +85,21 @@ function boot(opts: { route: Router; session?: boolean; stored?: Record<string, 
     location: { search: "?intent=I1", origin: "https://pay.test", href: "https://pay.test/checkout?intent=I1" },
     sessionStorage: session,
     localStorage: storage(),
-    navigator: { credentials: { get: async () => ({ id: "cred-1", response: { authenticatorData: buf, clientDataJSON: buf, signature: buf } }) } },
+    navigator: {
+      ...(lockMode === "absent"
+        ? {}
+        : {
+            locks: {
+              request: (name: string, _opts: unknown, cb: (lock: unknown) => unknown) => {
+                if (lockMode === "rejects") return Promise.reject(new Error("SecurityError"));
+                // A held lock lasts until the callback's promise settles: record when that happens.
+                return Promise.resolve(cb(lockMode === "busy" ? null : { name })).then(() => void lockReleases.push(name));
+              },
+            },
+          }),
+      credentials: { get: async () => ({ id: "cred-1", response: { authenticatorData: buf, clientDataJSON: buf, signature: buf } }) },
+    },
+    crypto: { getRandomValues: (a: Uint8Array) => a.fill(++randomSeq) },
     atob, btoa, URL, URLSearchParams, console,
     // Timers run at once. 1400ms is the pause before leaving for the merchant.
     setTimeout: (fn: () => void, ms: number) => {
@@ -90,7 +111,9 @@ function boot(opts: { route: Router; session?: boolean; stored?: Record<string, 
       const method = init.method ?? "GET";
       const body = init.body ? JSON.parse(init.body) : undefined;
       calls.push({ method, path: url, body });
-      const [status, json] = opts.route(method, url, body, calls);
+      const reply = opts.route(method, url, body, calls);
+      if (reply === "network") throw new TypeError("Failed to fetch");
+      const [status, json] = reply;
       return { ok: status >= 200 && status < 300, status, statusText: String(status), text: async () => JSON.stringify(json) };
     },
   });
@@ -102,14 +125,22 @@ function boot(opts: { route: Router; session?: boolean; stored?: Record<string, 
     destinationCommitment: () => "0xdest",
     signTypedData: async () => "0xsig",
     passkeyAssertion: async (req: unknown) => (req ? { assertion: true } : undefined),
+    ...opts.device,
   });
   const el = (id: string) => (els[id] ??= makeEl());
-  return { el, calls, session, redirects };
+  return { el, calls, session, redirects, lockReleases };
 }
 type Page = ReturnType<typeof boot>;
 
 /** A core + checkout service that behaves, with hooks for the part under test. */
-const happyRoute = (over: { attach?: (n: number) => Reply; intent?: (n: number) => Record<string, unknown> } = {}): Router => {
+const happyRoute = (
+  over: {
+    attach?: (n: number) => Reply;
+    intent?: (n: number) => Record<string, unknown>;
+    claim?: () => Reply;
+    authorize?: () => Reply;
+  } = {},
+): Router => {
   let intentReads = 0;
   let attaches = 0;
   return (method, p, _body, calls) => {
@@ -128,7 +159,9 @@ const happyRoute = (over: { attach?: (n: number) => Reply; intent?: (n: number) 
         },
       }];
     }
-    if (p === "/api/transfers/t1/authorize") return [200, { id: "t1", state: "PAYOUT_SUBMITTED" }];
+    if (p === "/api/checkout/intents/I1/claim") return over.claim ? over.claim() : [200, { status: "PAYING" }];
+    if (p === "/api/checkout/intents/I1/release") return [204, {}];
+    if (p === "/api/transfers/t1/authorize") return over.authorize ? over.authorize() : [200, { id: "t1", state: "PAYOUT_SUBMITTED" }];
     if (p === "/api/checkout/intents/I1/attach") {
       attaches++;
       return over.attach ? over.attach(attaches) : [200, { redirectUrl: "https://shop.test/cb?code=abc&state=s" }];
@@ -139,7 +172,10 @@ const happyRoute = (over: { attach?: (n: number) => Reply; intent?: (n: number) 
 
 const count = (page: Page, p: string, method = "POST") => page.calls.filter((c) => c.path === p && c.method === method).length;
 const shown = (page: Page, id: string) => !page.el(id).classes.has("hidden");
-const click = (page: Page) => page.el("btn-pay").onclick!();
+const click = async (page: Page) => {
+  await page.el("btn-pay").onclick!();
+  await settle();
+};
 const ATTACH = "/api/checkout/intents/I1/attach";
 const TRANSFER_KEY = "zold-checkout-transfer:I1";
 
@@ -191,7 +227,9 @@ describe("paying", () => {
   });
 
   it("re-checks the checkout is still open before it creates a transfer", async () => {
-    const page = boot({ route: happyRoute({ intent: (n) => (n === 1 ? INTENT : { ...INTENT, status: "AUTHORIZED" }) }) });
+    const page = boot({
+      route: happyRoute({ claim: () => [409, { error: "checkout already authorized", code: "checkout_closed" }] }),
+    });
     await settle();
     await click(page);
     assert.equal(count(page, "/api/transfers"), 0, "no money may move for a checkout that closed meanwhile");
@@ -274,11 +312,185 @@ describe("when the payment went through but the merchant was not told", () => {
     const page = boot({
       session: true,
       stored: { [TRANSFER_KEY]: "t1" },
-      route: happyRoute({ intent: () => ({ ...INTENT, status: "PAID" }), attach: () => [400, { error: "checkout already completed" }] }),
+      route: happyRoute({ intent: () => ({ ...INTENT, status: "PAID" }), attach: () => [400, { error: "checkout already completed", code: "checkout_completed" }] }),
     });
     await settle();
     await click(page);
     assert.equal(page.el("result-title").textContent, "Already paid");
     assert.equal(page.session.has(TRANSFER_KEY), false);
   });
+});
+
+const CLAIM = "/api/checkout/intents/I1/claim";
+const RELEASE = "/api/checkout/intents/I1/release";
+const CLAIM_KEY = "zold-checkout-claim:I1";
+const indexOf = (page: Page, p: string) => page.calls.findIndex((c) => c.path === p);
+const claimTokens = (page: Page) => page.calls.filter((c) => c.path === CLAIM).map((c) => c.body.claimToken as string);
+const UNUSUAL_BROWSER = /up-to-date browser/;
+
+describe("one payment per checkout, across tabs and devices", () => {
+  it("claims the checkout for this payer, with a token it made, before it creates a transfer", async () => {
+    const page = boot({ route: happyRoute() });
+    await settle();
+    await click(page);
+    const claim = page.calls.find((c) => c.path === CLAIM)!;
+    assert.equal(claim.body.userId, "u1");
+    assert.match(claim.body.claimToken, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(indexOf(page, CLAIM) < indexOf(page, "/api/transfers"), "the claim comes before any money can move");
+    assert.equal(page.el("result-title").textContent, "Payment sent");
+    assert.equal(page.session.has(CLAIM_KEY), false, "the claim is forgotten once the merchant is told");
+    assert.deepEqual(page.lockReleases, [CLAIM_KEY], "and the tab's lock is let go");
+  });
+
+  it("a second tab that cannot claim creates no transfer, says the payment is in progress, and lets go", async () => {
+    const page = boot({
+      route: happyRoute({ claim: () => [409, { error: "this checkout is already being paid", code: "payment_in_progress" }] }),
+    });
+    await settle();
+    await click(page);
+    assert.equal(count(page, "/api/transfers"), 0);
+    assert.equal(count(page, "/api/quotes"), 0);
+    assert.match(page.el("err").textContent, /being paid in another window/);
+    assert.equal(count(page, RELEASE), 0, "a refused tab holds no claim to release");
+    assert.equal(page.session.has(CLAIM_KEY), false);
+    assert.deepEqual(page.lockReleases, [CLAIM_KEY]);
+  });
+
+  it("asks again with the same token when the answer to the claim was lost", async () => {
+    let first = true;
+    const page = boot({ route: happyRoute({ claim: () => (first ? ((first = false), "network") : [200, { status: "PAYING" }]) }) });
+    await settle();
+    await click(page);
+    const [lost] = claimTokens(page);
+    // The claim may have been taken: it is released with the token the page kept.
+    assert.equal(page.calls.find((c) => c.path === RELEASE)!.body.claimToken, lost);
+    assert.equal(count(page, "/api/transfers"), 0);
+    await click(page);
+    assert.equal(page.el("result-title").textContent, "Payment sent");
+  });
+
+  it("keeps the token when the release also gets no answer, and the next claim reuses it", async () => {
+    let claims = 0;
+    const route = happyRoute({ claim: () => (++claims === 1 ? "network" : [200, { status: "PAYING" }]) });
+    const page = boot({ route: (m, p, b, c) => (p === RELEASE ? "network" : route(m, p, b, c)) });
+    await settle();
+    await click(page);
+    await click(page);
+    const [lost, retried] = claimTokens(page);
+    assert.equal(retried, lost);
+  });
+
+  it("shows no pay form for a checkout another tab or device is paying", async () => {
+    const page = boot({ route: happyRoute({ intent: () => ({ ...INTENT, status: "PAYING" }) }) });
+    await settle();
+    assert.equal(shown(page, "pay"), false);
+    assert.equal(page.el("result-title").textContent, "Payment in progress");
+  });
+
+  it("lets the tab holding the claim carry on after a reload, presenting its token", async () => {
+    const page = boot({
+      session: true,
+      stored: { [CLAIM_KEY]: "claim-1" },
+      route: happyRoute({ intent: () => ({ ...INTENT, status: "PAYING" }) }),
+    });
+    await settle();
+    assert.equal(shown(page, "pay"), true);
+    await click(page);
+    assert.deepEqual(claimTokens(page), ["claim-1"]);
+    assert.equal(page.el("result-title").textContent, "Payment sent");
+  });
+
+  it("releases the claim and the lock when the passkey is cancelled, because no money moved", async () => {
+    const page = boot({
+      route: happyRoute(),
+      device: { passkeyAssertion: async () => { throw new Error("The operation was cancelled"); } },
+    });
+    await settle();
+    await click(page);
+    assert.equal(page.calls.find((c) => c.path === RELEASE)!.body.claimToken, claimTokens(page)[0]);
+    assert.equal(page.session.has(TRANSFER_KEY), false);
+    assert.equal(page.session.has(CLAIM_KEY), false);
+    assert.deepEqual(page.lockReleases, [CLAIM_KEY]);
+    assert.doesNotMatch(page.el("err").textContent, /do not pay again/i);
+  });
+
+  it("releases the claim when the core refuses the authorization", async () => {
+    const page = boot({ route: happyRoute({ authorize: () => [400, { error: "insufficient balance" }] }) });
+    await settle();
+    await click(page);
+    assert.equal(count(page, RELEASE), 1);
+    assert.equal(page.session.has(TRANSFER_KEY), false);
+    assert.match(page.el("err").textContent, /insufficient balance/);
+  });
+
+  for (const [what, reply] of [
+    ["a 502", [502, { error: "the Zold API could not complete the request" }]],
+    ["a 409", [409, { error: "conflict" }]],
+    ["a 408", [408, { error: "timeout" }]],
+    ["a 422", [422, { error: "unprocessable" }]],
+    ["no answer at all", "network"],
+  ] as [string, Reply][]) {
+    it(`keeps the claim and remembers the transfer when the authorization gets ${what}`, async () => {
+      const page = boot({ route: happyRoute({ authorize: () => reply }) });
+      await settle();
+      await click(page);
+      assert.equal(count(page, RELEASE), 0, "the money may have moved: the checkout stays with this tab");
+      assert.equal(page.session.getItem(TRANSFER_KEY), "t1");
+      assert.equal(page.session.getItem(CLAIM_KEY), claimTokens(page)[0]);
+      assert.match(page.el("err").textContent, /do not pay again/i);
+      assert.equal(page.el("btn-pay").textContent, "Confirm with merchant");
+    });
+  }
+});
+
+describe("the tab lock", () => {
+  it("a duplicated tab that copied the claim does not resume it while the original tab holds it", async () => {
+    const page = boot({
+      session: true,
+      stored: { [CLAIM_KEY]: "claim-1" },
+      locks: "busy",
+      route: happyRoute({ intent: () => ({ ...INTENT, status: "PAYING" }) }),
+    });
+    await settle();
+    assert.equal(shown(page, "pay"), false);
+    assert.equal(page.el("result-title").textContent, "Payment in progress");
+  });
+
+  it("an open checkout cannot be paid from a tab while another tab of this browser holds its lock", async () => {
+    const page = boot({ route: happyRoute(), locks: "busy" });
+    await settle();
+    await click(page);
+    assert.equal(count(page, CLAIM), 0);
+    assert.equal(count(page, "/api/transfers"), 0);
+    assert.match(page.el("err").textContent, /being paid in another window/);
+  });
+
+  for (const locks of ["absent", "rejects"] as const) {
+    it(`refuses, without hanging, in a browser whose Web Locks are ${locks}`, async () => {
+      const page = boot({ route: happyRoute(), locks });
+      await settle();
+      assert.equal(shown(page, "pay"), true, "the page loads");
+      await click(page);
+      assert.equal(count(page, CLAIM), 0);
+      assert.equal(count(page, "/api/transfers"), 0);
+      assert.match(page.el("err").textContent, UNUSUAL_BROWSER);
+      assert.equal(page.el("btn-pay").disabled, false, "the button comes back");
+    });
+  }
+});
+
+describe("a payment the checkout could not take", () => {
+  for (const code of ["duplicate_payment", "late_payment"]) {
+    it(`ends on a clear answer for ${code}, and stops offering to confirm`, async () => {
+      const page = boot({ route: happyRoute({ attach: () => [409, { error: "recorded; the merchant will refund it", code }] }) });
+      await settle();
+      await click(page);
+      assert.equal(page.el("result-title").textContent, "Payment recorded");
+      assert.match(page.el("result-note").textContent, /refund/);
+      assert.equal(shown(page, "pay"), false);
+      assert.equal(page.session.has(TRANSFER_KEY), false);
+      assert.equal(page.session.has(CLAIM_KEY), false);
+      assert.deepEqual(page.lockReleases, [CLAIM_KEY]);
+    });
+  }
 });

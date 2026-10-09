@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beforeEach, describe, it } from "node:test";
@@ -169,7 +169,10 @@ describe("attachTransfer", () => {
     const { intent } = setup();
     attach(intent.id);
     const before = store.findPaymentIntent(intent.id)!.codeHash;
-    assert.throws(() => attach(intent.id, { id: "t2" }), { message: "intent already authorized" });
+    // Made for this checkout, so it is a second payment: refused, and recorded for a refund.
+    assert.equal(refusal(() => attach(intent.id, { id: "t2" })).code, "duplicate_payment");
+    // Not made for this checkout: plainly refused.
+    assert.equal(refusal(() => attach(intent.id, { id: "t3", receiveEur: 1 })).code, "checkout_closed");
     assert.equal(store.findPaymentIntent(intent.id)!.codeHash, before, "the first code is untouched");
   });
 });
@@ -215,7 +218,8 @@ describe("attachTransfer retries and timing", () => {
   it("refuses, and marks the checkout expired, once the grace period is also over", () => {
     const { intent } = setup();
     store.updatePaymentIntent(intent.id, { createdAt: ago(INTENT_TTL_MS + ATTACH_GRACE_MS + MIN) });
-    assert.throws(() => attach(intent.id), { message: "checkout expired" });
+    // Refused, but the settled payment is recorded for a refund rather than lost.
+    assert.equal(refusal(() => attach(intent.id)).code, "late_payment");
     assert.equal(store.findPaymentIntent(intent.id)!.status, "EXPIRED");
   });
 
@@ -345,5 +349,227 @@ describe("production merchant check", () => {
   it("refuses a wildcard redirect URI outside the local demo", () => {
     assert.throws(() => co.assertNoWildcardRedirects([m(["https://ok.test/cb"]), m(["*"])]), /wildcard/);
     assert.doesNotThrow(() => co.assertNoWildcardRedirects([m(["https://ok.test/cb"])]));
+  });
+});
+
+/** A claim token as the page makes it: 32 random bytes, base64url. */
+const newClaimToken = () => randomBytes(32).toString("base64url");
+
+/**
+ * Two tabs (or two devices) that both load an open checkout must not both be able to
+ * pay it: the second payment would reach the merchant, and a SEPA payout cannot be
+ * recalled. So the page claims the checkout BEFORE any core transfer exists, and only
+ * the claim holder may go on to pay. The page makes the claim token itself and keeps
+ * it before asking, so a lost answer can be retried with the same token.
+ */
+describe("claiming a checkout before paying", () => {
+  let intentId: string;
+  beforeEach(() => void (intentId = setup().intent.id));
+
+  it("moves an open checkout to PAYING for one payer, storing only a hash of the page's token", () => {
+    const token = newClaimToken();
+    co.claimIntent(intentId, "u1", token);
+    const saved = store.findPaymentIntent(intentId)!;
+    assert.equal(saved.status, "PAYING");
+    assert.equal(saved.claimUserId, "u1");
+    assert.equal(saved.claimTokenHash, hashSecret(token));
+    assert.equal(JSON.stringify(saved).includes(token), false);
+  });
+
+  it("refuses a second claim from another tab of the same payer, and from another payer", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    for (const [user, token] of [["u1", newClaimToken()], ["u2", newClaimToken()]] as const) {
+      const e = refusal(() => co.claimIntent(intentId, user, token));
+      assert.equal(e.code, "payment_in_progress");
+      assert.equal(e.status, 409);
+    }
+  });
+
+  it("lets the holder claim again with its token, so a lost answer does not lock the checkout", () => {
+    const token = newClaimToken();
+    co.claimIntent(intentId, "u1", token);
+    co.claimIntent(intentId, "u1", token);
+    assert.equal(store.findPaymentIntent(intentId)!.status, "PAYING");
+    assert.equal(refusal(() => co.claimIntent(intentId, "u2", token)).code, "payment_in_progress");
+  });
+
+  it("refuses the holder's resume once the checkout is past its time limit", () => {
+    const token = newClaimToken();
+    co.claimIntent(intentId, "u1", token);
+    store.updatePaymentIntent(intentId, { createdAt: ago(INTENT_TTL_MS + MIN) });
+    assert.equal(refusal(() => co.claimIntent(intentId, "u1", token)).code, "checkout_expired");
+    assert.equal(refusal(() => co.claimIntent(intentId, "u2", newClaimToken())).code, "payment_in_progress");
+  });
+
+  it("refuses to claim a checkout that is already paid, expired, or unknown", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    attach(intentId);
+    assert.equal(refusal(() => co.claimIntent(intentId, "u1", newClaimToken())).code, "checkout_closed");
+
+    const late = setup().intent.id;
+    store.updatePaymentIntent(late, { createdAt: ago(INTENT_TTL_MS + MIN) });
+    assert.equal(refusal(() => co.claimIntent(late, "u1", newClaimToken())).code, "checkout_expired");
+
+    assert.equal(refusal(() => co.claimIntent("nope", "u1", newClaimToken())).code, "unknown_checkout");
+  });
+
+  it("releases a claim back to PENDING only for the token holder, and only before a payment is attached", () => {
+    const token = newClaimToken();
+    co.claimIntent(intentId, "u1", token);
+    assert.equal(refusal(() => co.releaseClaim(intentId, "wrong")).code, "not_claim_holder");
+    co.releaseClaim(intentId, token);
+    const released = store.findPaymentIntent(intentId)!;
+    assert.equal(released.status, "PENDING");
+    assert.equal(released.claimUserId, undefined);
+    assert.equal(released.claimTokenHash, undefined);
+
+    const again = newClaimToken();
+    co.claimIntent(intentId, "u2", again);
+    attach(intentId, { userId: "u2" });
+    assert.equal(refusal(() => co.releaseClaim(intentId, again)).code, "checkout_closed");
+  });
+
+  it("attaches the claim holder's payment and clears the claim", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    assert.ok(codeOf(attach(intentId).redirectUrl));
+    const saved = store.findPaymentIntent(intentId)!;
+    assert.equal(saved.status, "AUTHORIZED");
+    assert.equal(saved.claimUserId, undefined);
+    assert.equal(saved.claimTokenHash, undefined);
+    assert.equal(saved.claimedAt, undefined);
+  });
+
+  it("attaches a payment made after the claim was released and taken again by the same payer", () => {
+    co.claimIntent(intentId, "u1", "a".repeat(43));
+    co.releaseClaim(intentId, "a".repeat(43));
+    assert.ok(codeOf(attach(intentId).redirectUrl), "a released checkout is PENDING, and PENDING can be attached");
+  });
+
+  it("still counts a claimed checkout as open for the pending cap, and keeps it a day", () => {
+    const merchantId = store.findPaymentIntent(intentId)!.merchantId;
+    co.claimIntent(intentId, "u1", newClaimToken());
+    assert.equal(store.pendingCount(merchantId), 1);
+    // A claimed checkout may have money in flight, so it outlives an abandoned open one.
+    store.updatePaymentIntent(intentId, { createdAt: ago(2 * 60 * MIN) });
+    store.sweep();
+    assert.ok(store.findPaymentIntent(intentId), "kept while a payment may still arrive");
+    store.updatePaymentIntent(intentId, { createdAt: ago(25 * 60 * MIN) });
+    store.sweep();
+    assert.equal(store.findPaymentIntent(intentId), undefined);
+  });
+});
+
+/**
+ * A payment made for a checkout that cannot be attached to it: a second payment
+ * for a paid checkout, a payment by someone who does not hold the claim, or one
+ * that arrived after the checkout closed. The money has left the payer and SEPA
+ * cannot be recalled by us, so it is recorded on the checkout, never dropped.
+ */
+describe("payments that cannot be attached", () => {
+  let intentId: string;
+  beforeEach(() => void (intentId = setup().intent.id));
+  const recorded = () => store.findPaymentIntent(intentId)!.unattachedPayments ?? [];
+
+  it("records a second settled payment for a paid checkout once, with its state, and shows it to the merchant", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    attach(intentId);
+    const dup = refusal(() => attach(intentId, { id: "t2", userId: "u2" }));
+    assert.equal(dup.code, "duplicate_payment");
+    assert.equal(dup.status, 409);
+    refusal(() => attach(intentId, { id: "t2", userId: "u2" }));
+    assert.equal(recorded().length, 1);
+    const [entry] = recorded();
+    assert.equal(entry.transferId, "t2");
+    assert.equal(entry.reason, "duplicate");
+    assert.equal(entry.state, "PAYOUT_SUBMITTED");
+    assert.ok(Number.isFinite(Date.parse(entry.recordedAt)));
+    assert.deepEqual(co.merchantView(store.findPaymentIntent(intentId)!).unattachedPayments, [
+      { transferId: "t2", amountEur: 12.5, reason: "duplicate", state: "PAYOUT_SUBMITTED", recordedAt: entry.recordedAt },
+    ]);
+    assert.equal(store.findPaymentIntent(intentId)!.transferId, "t1", "the first payment still backs the checkout");
+  });
+
+  it("records a payment by someone who does not hold the claim, and the holder can still finish", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    assert.equal(refusal(() => attach(intentId, { id: "t9", userId: "u2" })).code, "duplicate_payment");
+    assert.equal(store.findPaymentIntent(intentId)!.status, "PAYING");
+    assert.equal(recorded()[0].reason, "claimed_by_another");
+    assert.ok(codeOf(attach(intentId).redirectUrl));
+  });
+
+  it("records the claim holder's settled payment that arrives after the attach window, instead of losing it", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    store.updatePaymentIntent(intentId, { createdAt: ago(INTENT_TTL_MS + ATTACH_GRACE_MS + MIN) });
+    const e = refusal(() => attach(intentId));
+    assert.equal(e.code, "late_payment");
+    assert.equal(store.findPaymentIntent(intentId)!.status, "EXPIRED");
+    assert.equal(recorded()[0].reason, "late");
+    // An expired checkout holding a recorded payment is not swept with the abandoned ones.
+    store.sweep(Date.now() + 2 * 60 * MIN);
+    assert.ok(store.findPaymentIntent(intentId));
+  });
+
+  it("records a settled payment for a checkout that had already expired", () => {
+    store.updatePaymentIntent(intentId, { status: "EXPIRED" });
+    assert.equal(refusal(() => attach(intentId, { id: "t5" })).code, "late_payment");
+    assert.equal(recorded()[0].transferId, "t5");
+  });
+
+  it("does not record a late payment that has not settled, or that was not made for this checkout", () => {
+    store.updatePaymentIntent(intentId, { createdAt: ago(INTENT_TTL_MS + ATTACH_GRACE_MS + MIN) });
+    assert.equal(refusal(() => attach(intentId, { state: "PAYOUT_PENDING" })).code, "checkout_expired");
+    assert.equal(refusal(() => attach(intentId, { receiveEur: 1 })).code, "checkout_expired");
+    assert.deepEqual(recorded(), []);
+  });
+
+  it("does not record a second transfer that has not moved money, and asks the page to retry", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    attach(intentId);
+    for (const state of ["CREATED", "PAYOUT_PENDING"]) {
+      const e = refusal(() => attach(intentId, { id: "t-draft", userId: "u2", state }));
+      assert.equal(e.code, "not_settled");
+      assert.equal(e.retryable, true);
+    }
+    assert.deepEqual(recorded(), []);
+  });
+
+  it("does not record a failed second transfer, or one not made for this checkout", () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    attach(intentId);
+    assert.equal(refusal(() => attach(intentId, { id: "t3", userId: "u2", state: "FAILED" })).code, "checkout_closed");
+    assert.equal(refusal(() => attach(intentId, { id: "t4", userId: "u2", receiveEur: 99 })).code, "checkout_closed");
+    assert.deepEqual(recorded(), []);
+  });
+
+  it(`keeps at most ${co.MAX_UNATTACHED_PAYMENTS} records, flags the rest, and never counts a retry twice`, () => {
+    co.claimIntent(intentId, "u1", newClaimToken());
+    attach(intentId);
+    for (let n = 0; n <= co.MAX_UNATTACHED_PAYMENTS; n++) refusal(() => attach(intentId, { id: `d${n}`, userId: "u2" }));
+    refusal(() => attach(intentId, { id: "d0", userId: "u2" }));
+    const saved = store.findPaymentIntent(intentId)!;
+    assert.equal(saved.unattachedPayments!.length, co.MAX_UNATTACHED_PAYMENTS);
+    assert.equal(saved.unattachedPaymentsTruncated, true);
+    assert.equal(co.merchantView(saved).unattachedPaymentsTruncated, true);
+  });
+});
+
+describe("compatibility", () => {
+  it("keeps the payer subject issued before this change (NUL-separated HMAC input)", () => {
+    // Computed by main's payerSubject with CHECKOUT_SUBJECT_SECRET=test-subject-secret.
+    assert.equal(co.payerSubject("m1", "u1"), "O5e7okxICZOuRcM2lTKHyU9Pr16daW2t");
+  });
+
+  it("claims and attaches a checkout loaded from a file written before claims existed", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pay-legacy-"));
+    const file = path.join(dir, "checkout.json");
+    const legacyIntent = {
+      id: "legacy-1", merchantId: "m1", amountEur: 12.5, reference: "order-77", payRef: "ZP0123456789AB",
+      destinationIban: IBAN, redirectUri: "https://shop.test/cb", state: "st", codeChallenge: CHALLENGE,
+      status: "PENDING", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(file, JSON.stringify({ merchants: [merchantRecord("m1", "shop", "s3cret")], paymentIntents: [legacyIntent] }));
+    initStore(file);
+    co.claimIntent("legacy-1", "u1", newClaimToken());
+    assert.ok(codeOf(attach("legacy-1").redirectUrl));
   });
 });
