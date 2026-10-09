@@ -51,7 +51,9 @@ export async function core<T = any>(path: string, opts: CoreCallOptions = {}): P
     try {
       data = JSON.parse(text);
     } catch {
-      data = { error: text.slice(0, 500) };
+      // Not JSON (a gateway's HTML error page, say). Its text is not ours to pass
+      // on, and a 2xx with no usable body is rejected by whoever validates the reply.
+      data = undefined;
     }
   }
   if (!res.ok) throw coreError(res.status, data);

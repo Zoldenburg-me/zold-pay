@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 
 const { hashSecret } = await import("../server/src/secrets.js");
-const { initStore, store } = await import("../server/src/store.js");
+const { INTENT_TTL_MS, initStore, store } = await import("../server/src/store.js");
 
 const tmpDb = () => path.join(mkdtempSync(path.join(tmpdir(), "pay-store-")), "checkout.json");
 const NOW = "2026-10-09T10:00:00.000Z";
@@ -125,5 +125,102 @@ describe("housekeeping", () => {
     assert.equal(store.pendingCount("m1"), 2);
     assert.equal(store.findPaymentIntentByTransfer("t-9")?.id, "d");
     assert.equal(store.findPaymentIntentByTransfer("nope"), undefined);
+  });
+
+  it("counts only live pending checkouts, per channel", () => {
+    initStore(tmpDb());
+    const stale = new Date(Date.now() - INTENT_TTL_MS - 60_000).toISOString();
+    store.addPaymentIntent(base({ id: "live-back", merchantId: "m1", status: "PENDING" }));
+    store.addPaymentIntent(base({ id: "live-front", merchantId: "m1", status: "PENDING", channel: "front" }));
+    store.addPaymentIntent(base({ id: "stale-back", merchantId: "m1", status: "PENDING", createdAt: stale }));
+    store.addPaymentIntent(base({ id: "stale-front", merchantId: "m1", status: "PENDING", channel: "front", createdAt: stale }));
+    assert.equal(store.pendingCount("m1"), 1, "back channel is the default and ignores stale ones");
+    assert.equal(store.pendingCount("m1", "back"), 1);
+    assert.equal(store.pendingCount("m1", "front"), 1);
+  });
+
+  it("gives intents saved before payRef existed a unique one, once, and keeps it across restarts", () => {
+    const file = tmpDb();
+    writeFileSync(file, JSON.stringify(legacy()));
+    initStore(file);
+    const a = store.findPaymentIntent("i-open")!.payRef;
+    const b = store.findPaymentIntent("i-done")!.payRef;
+    assert.match(a, /^ZP[0-9A-F]{12}$/);
+    assert.notEqual(a, b);
+    initStore(file);
+    assert.equal(store.findPaymentIntent("i-open")!.payRef, a);
+  });
+});
+
+// A write that fails (disk full, permissions) must leave memory exactly as it was,
+// or a request that returned a 500 would still have changed what the service believes.
+describe("durability when the disk write fails", () => {
+  const skip = process.getuid?.() === 0 ? "running as root: directory permissions are not enforced" : false;
+  const intent = (over: Record<string, unknown>) => ({
+    merchantId: "m1", amountEur: 1, reference: "", payRef: "ZP000000000001", destinationIban: "DE89370400440532013000",
+    redirectUri: "https://m.test/cb", state: "", codeChallenge: "c",
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...over,
+  }) as any;
+
+  /** Run `fn` with the store's directory read-only, then restore it so cleanup works. */
+  function withBrokenDisk(fn: () => void, dir: string) {
+    chmodSync(dir, 0o500);
+    try {
+      fn();
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  }
+  const fresh = () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pay-durable-"));
+    initStore(path.join(dir, "checkout.json"));
+    return dir;
+  };
+
+  it("does not add an intent that could not be saved", { skip }, () => {
+    const dir = fresh();
+    withBrokenDisk(() => assert.throws(() => store.addPaymentIntent(intent({ id: "ghost", status: "PENDING" }))), dir);
+    assert.equal(store.findPaymentIntent("ghost"), undefined);
+    store.addPaymentIntent(intent({ id: "real", status: "PENDING" }));
+    assert.ok(store.findPaymentIntent("real"), "the store recovers once the disk does");
+  });
+
+  it("does not add a merchant that could not be saved", { skip }, () => {
+    const dir = fresh();
+    withBrokenDisk(() => assert.throws(() => store.addMerchant({
+      id: "gm", name: "G", clientId: "ghost", clientSecretHash: "h", settlementIbans: [], redirectUris: [], createdAt: NOW,
+    })), dir);
+    assert.equal(store.findMerchantByClientId("ghost"), undefined);
+  });
+
+  it("keeps an unsaved update out of memory, so a burned code is never half-burned", { skip }, () => {
+    const dir = fresh();
+    store.addPaymentIntent(intent({ id: "i1", status: "AUTHORIZED", codeHash: "h", codeExpiresAt: new Date(Date.now() + 60_000).toISOString() }));
+    withBrokenDisk(() => assert.throws(() => store.updatePaymentIntent("i1", { codeHash: undefined, status: "PAID" })), dir);
+    const after = store.findPaymentIntent("i1")!;
+    assert.equal(after.codeHash, "h");
+    assert.equal(after.status, "AUTHORIZED");
+    store.updatePaymentIntent("i1", { codeHash: undefined });
+    assert.equal(store.findPaymentIntent("i1")!.codeHash, undefined);
+  });
+
+  it("keeps an unsaved sweep out of memory", { skip }, () => {
+    const dir = fresh();
+    const old = new Date(Date.now() - 2 * 3600_000).toISOString();
+    store.addPaymentIntent(intent({ id: "old", status: "PENDING", createdAt: old }));
+    withBrokenDisk(() => assert.throws(() => store.sweep()), dir);
+    assert.ok(store.findPaymentIntent("old"), "memory still matches the file on disk");
+    store.sweep();
+    assert.equal(store.findPaymentIntent("old"), undefined);
+  });
+
+  it("sweepSafely reports a failed sweep instead of throwing out of a timer", { skip }, () => {
+    const dir = fresh();
+    store.addPaymentIntent(intent({ id: "old", status: "PENDING", createdAt: new Date(Date.now() - 2 * 3600_000).toISOString() }));
+    const logged: unknown[][] = [];
+    withBrokenDisk(() => assert.equal(store.sweepSafely((...a) => logged.push(a)), false), dir);
+    assert.equal(logged.length, 1);
+    assert.match(String(logged[0][0]), /sweep failed/);
+    assert.equal(store.sweepSafely(() => assert.fail("nothing to report")), true);
   });
 });

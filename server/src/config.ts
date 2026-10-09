@@ -65,6 +65,8 @@ export interface Config {
   environment: "production" | "development" | "unset";
   /** Most open (pending) checkouts one merchant may have at a time. */
   maxPendingIntents: number;
+  /** Cap for checkouts started through the unauthenticated front channel. Smaller, and counted separately. */
+  maxPendingFrontIntents: number;
   /** Reverse-proxy hops in front of this process (Express `trust proxy`); undefined = not declared. */
   trustedProxyHops?: number;
   /** Largest checkout amount accepted, in EUR. */
@@ -126,6 +128,7 @@ export const CONFIG: Config = {
 
   maxAmountEur: num("CHECKOUT_MAX_AMOUNT_EUR", process.env.CHECKOUT_MAX_AMOUNT_EUR, 10_000),
   maxPendingIntents: num("CHECKOUT_MAX_PENDING_INTENTS", process.env.CHECKOUT_MAX_PENDING_INTENTS, 1000),
+  maxPendingFrontIntents: num("CHECKOUT_MAX_PENDING_FRONT_INTENTS", process.env.CHECKOUT_MAX_PENDING_FRONT_INTENTS, 200),
 
   rateLimit: {
     windowMs: 60_000,
@@ -150,9 +153,19 @@ export function coreIsLoopback(cfg: Config = CONFIG): boolean {
   return isLoopbackUrl(cfg.coreApiUrl);
 }
 
-/** The demo merchant needs BOTH the opt-in and a loopback core. */
+/** Is this service itself served from a loopback address? */
+export function originIsLoopback(cfg: Config = CONFIG): boolean {
+  return isLoopbackUrl(cfg.publicOrigin);
+}
+
+/**
+ * The demo merchant has a published secret and accepts any redirect URI, so it
+ * must only exist where nobody else can reach it: it needs the opt-in, a loopback
+ * core AND a loopback public origin. A loopback core alone says nothing about who
+ * can reach this service.
+ */
 export function devShortcutsEnabled(cfg: Config = CONFIG): boolean {
-  return cfg.allowDevShortcuts && coreIsLoopback(cfg);
+  return cfg.allowDevShortcuts && coreIsLoopback(cfg) && originIsLoopback(cfg);
 }
 
 const MIN_PRODUCTION_SECRET_LENGTH = 32;
@@ -170,6 +183,13 @@ export function assertConfigSane(cfg: Config = CONFIG): void {
     throw new Error(
       `ALLOW_DEV_SHORTCUTS=1 but CORE_API_URL is ${cfg.coreApiUrl}, which is not loopback. ` +
         "The demo merchant is local-only; refusing to start.",
+    );
+  }
+  if (cfg.allowDevShortcuts && !originIsLoopback(cfg)) {
+    throw new Error(
+      `ALLOW_DEV_SHORTCUTS=1 but CHECKOUT_PUBLIC_ORIGIN is ${cfg.publicOrigin}, which is not loopback. ` +
+        "The demo merchant's secret is published and its redirect URIs are a wildcard, so it must not be " +
+        "reachable from anywhere but this machine; refusing to start.",
     );
   }
   if (!/^https?:\/\//.test(cfg.appUrl) || !URL.canParse(cfg.appUrl)) {

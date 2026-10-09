@@ -14,13 +14,32 @@
  * The payer's legal name is kept only until the merchant's code exchange (or the
  * code's expiry), then dropped.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import path from "node:path";
 import { ROOT } from "./config.js";
 import { hashSecret } from "./secrets.js";
 
 /** How long an authorization code stays exchangeable after the transfer is attached. */
 export const CODE_TTL_MS = 10 * 60_000;
+
+/** How long a checkout can be started and paid. After this the page refuses to begin a payment. */
+export const INTENT_TTL_MS = 15 * 60_000;
+
+/**
+ * Extra time to attach a payment that was already made. The passkey ceremonies and
+ * a slow payout can run past INTENT_TTL_MS; refusing then would leave a payer
+ * debited with nothing to show the merchant.
+ */
+export const ATTACH_GRACE_MS = 10 * 60_000;
+
+/**
+ * A reference unique to one checkout. It rides on the SEPA payment, so a transfer
+ * can only ever match the checkout it was made for: an older payment to the same
+ * account for the same amount cannot be passed off as this one. Upper-case hex
+ * keeps it inside the SEPA remittance character set.
+ */
+export const newPayRef = () => "ZP" + randomBytes(6).toString("hex").toUpperCase();
 
 export interface Merchant {
   id: string;
@@ -50,7 +69,16 @@ export interface PaymentIntent {
   id: string;
   merchantId: string;
   amountEur: number;
+  /** The merchant's own reference for the order (may be empty). */
   reference: string;
+  /** Unique to this checkout; see newPayRef. Always part of the payment's reference. */
+  payRef: string;
+  /**
+   * How the checkout was started. The front channel needs only the public client
+   * id, so it is capped on its own and cannot crowd out the authenticated one.
+   * Absent on older records, which were all back channel.
+   */
+  channel?: "front" | "back";
   /**
    * The settlement account this specific payment must land in, resolved from
    * the merchant's allowlist when the intent was created. Pinned per intent so
@@ -131,24 +159,29 @@ function migrate(raw: any): { db: Db; changed: boolean } {
       changed = true;
       out = { ...withoutKeys(out, "statusToken"), statusTokenHash: hashSecret(out.statusToken) };
     }
+    // Saved before checkouts carried their own reference. Assigned once and then
+    // persisted, so it is the same after every restart.
+    if (typeof out.payRef !== "string" || !out.payRef) {
+      changed = true;
+      out = { ...out, payRef: newPayRef() };
+    }
     return out;
   });
 
   return { db: { merchants, paymentIntents }, changed };
 }
 
-/** Drop payer names whose code is gone or expired. Returns whether anything changed. */
-function purgeStalePayerNames(now = Date.now()): boolean {
+/** Drop payer names whose code is gone or expired. Pure: returns new records and whether any changed. */
+function purgeStalePayerNames(intents: readonly PaymentIntent[], now = Date.now()): { intents: PaymentIntent[]; changed: boolean } {
   let changed = false;
-  for (const i of db.paymentIntents) {
-    if (i.payerName === undefined) continue;
+  const next = intents.map((i) => {
+    if (i.payerName === undefined) return i;
     const live = i.codeHash && i.codeExpiresAt && Date.parse(i.codeExpiresAt) >= now;
-    if (!live) {
-      delete i.payerName;
-      changed = true;
-    }
-  }
-  return changed;
+    if (live) return i;
+    changed = true;
+    return withoutKeys(i, "payerName");
+  });
+  return { intents: next, changed };
 }
 
 export function initStore(file: string = DEFAULT_DB_PATH): void {
@@ -162,16 +195,46 @@ export function initStore(file: string = DEFAULT_DB_PATH): void {
     throw new Error(`could not read ${dbPath}: ${e?.message ?? e}`);
   }
   const migrated = migrate(raw);
-  db = migrated.db;
-  const purged = purgeStalePayerNames();
-  if (migrated.changed || purged) persist();
+  const purged = purgeStalePayerNames(migrated.db.paymentIntents);
+  const loaded: Db = { merchants: migrated.db.merchants, paymentIntents: purged.intents };
+  if (migrated.changed || purged.changed) commit(loaded);
+  else db = loaded;
 }
 
-function persist(): void {
+/**
+ * Write `next` to disk: temp file, flushed to the device, then renamed over the
+ * old one, so a crash leaves either the old file or the new one, never half of one.
+ */
+function persist(next: Db): void {
   mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
   const tmp = dbPath + ".tmp";
-  writeFileSync(tmp, JSON.stringify(db, null, 2), { mode: 0o600 });
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeSync(fd, JSON.stringify(next, null, 2));
+    fsyncSync(fd);
+  } catch (e) {
+    closeSync(fd);
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing to clean up */
+    }
+    throw e;
+  }
+  closeSync(fd);
   renameSync(tmp, dbPath);
+}
+
+/**
+ * The only way state changes: write the new state first, and only if that
+ * worked make it the one the service believes. A failed write therefore leaves
+ * memory exactly as it was, instead of ahead of a disk that never saw the change
+ * (a code that looks burned but comes back after a restart, a payment recorded
+ * that was never saved).
+ */
+function commit(next: Db): void {
+  persist(next);
+  db = next;
 }
 
 /** Abandoned checkouts are dropped after this; settled ones are kept for the merchant to poll. */
@@ -183,8 +246,7 @@ export const store = {
   findMerchant: (id: string) => db.merchants.find((m) => m.id === id),
   findMerchantByClientId: (clientId: string) => db.merchants.find((m) => m.clientId === clientId),
   addMerchant(m: Merchant) {
-    db.merchants.push(m);
-    persist();
+    commit({ ...db, merchants: [...db.merchants, m] });
     return m;
   },
 
@@ -194,21 +256,46 @@ export const store = {
     if (!transferId) return undefined;
     return db.paymentIntents.find((i) => i.transferId === transferId);
   },
-  pendingCount: (merchantId: string) =>
-    db.paymentIntents.filter((i) => i.merchantId === merchantId && i.status === "PENDING").length,
+  /**
+   * Checkouts a merchant can still be paid through, on one channel. Ones past
+   * their time limit are not counted even though they stay PENDING until swept:
+   * otherwise anyone holding the public client id could fill the cap with checkouts
+   * that can no longer be paid and lock the merchant out for an hour.
+   */
+  pendingCount: (merchantId: string, channel: "front" | "back" = "back", now: number = Date.now()) =>
+    db.paymentIntents.filter(
+      (i) =>
+        i.merchantId === merchantId &&
+        i.status === "PENDING" &&
+        (i.channel ?? "back") === channel &&
+        now - Date.parse(i.createdAt) <= INTENT_TTL_MS,
+    ).length,
   /**
    * Housekeeping, safe to call often: drops long-dead checkouts (so unauthenticated
    * intent creation cannot grow the file without bound) and the payer names of
    * codes that expired without being exchanged.
    */
   sweep(now: number = Date.now()) {
-    const before = db.paymentIntents.length;
-    db.paymentIntents = db.paymentIntents.filter(
+    const kept = db.paymentIntents.filter(
       (i) => !(DEAD_STATUSES.has(i.status) && now - Date.parse(i.createdAt) > DEAD_INTENT_MAX_AGE_MS),
     );
-    const pruned = db.paymentIntents.length !== before;
-    const purged = purgeStalePayerNames(now);
-    if (pruned || purged) persist();
+    const purged = purgeStalePayerNames(kept, now);
+    if (kept.length !== db.paymentIntents.length || purged.changed) {
+      commit({ ...db, paymentIntents: purged.intents });
+    }
+  },
+  /**
+   * `sweep` for a timer: a failed write is reported, not thrown, so one bad
+   * minute on the disk cannot take the whole service down mid-payment.
+   */
+  sweepSafely(log: (...args: unknown[]) => void = console.error): boolean {
+    try {
+      store.sweep();
+      return true;
+    } catch (e) {
+      log("checkout store: sweep failed", e instanceof Error ? e.message : e);
+      return false;
+    }
   },
   findPaymentIntentByCode(code: string) {
     // An empty/undefined code must never match an intent whose code was burned.
@@ -217,19 +304,23 @@ export const store = {
     return db.paymentIntents.find((i) => i.codeHash === hash);
   },
   addPaymentIntent(i: PaymentIntent) {
-    db.paymentIntents.push(i);
-    persist();
+    commit({ ...db, paymentIntents: [...db.paymentIntents, i] });
     return i;
   },
+  /**
+   * Returns the updated record. Records are never changed in place, so a copy
+   * held earlier does not silently change underneath its holder: re-read by id.
+   */
   updatePaymentIntent(id: string, patch: Partial<PaymentIntent>) {
-    const i = db.paymentIntents.find((x) => x.id === id);
-    if (!i) throw new Error("intent not found");
-    Object.assign(i, patch, { updatedAt: new Date().toISOString() });
+    const old = db.paymentIntents.find((x) => x.id === id);
+    if (!old) throw new Error("intent not found");
     // `undefined` must actually delete the key, or a burned code could match again.
-    for (const [k, v] of Object.entries(patch)) {
-      if (v === undefined) delete (i as any)[k];
-    }
-    persist();
-    return i;
+    const cleared = Object.entries(patch).filter(([, v]) => v === undefined).map(([k]) => k);
+    const updated: PaymentIntent = {
+      ...withoutKeys({ ...old, ...patch }, ...cleared),
+      updatedAt: new Date().toISOString(),
+    };
+    commit({ ...db, paymentIntents: db.paymentIntents.map((x) => (x.id === id ? updated : x)) });
+    return updated;
   },
 };
