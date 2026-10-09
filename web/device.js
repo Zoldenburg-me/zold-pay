@@ -1,47 +1,45 @@
 /**
- * FP4 device key (browser side).
+ * Device key (browser side).
  *
- * The key that authorizes payments lives here — generated in this browser,
- * never sent anywhere. The server learns only the address. RemitVault refuses
- * any debit not signed by this key over the payment's exact terms, so the
- * server (which holds every other key in the system) cannot move a balance on
- * its own.
+ * The key that authorizes payments is generated in this browser and never
+ * sent anywhere. The server learns only the address. The key signs the
+ * payment's exact terms (amount, payee commitment, deadline), so nothing can
+ * be swapped after the user approves.
+ *
+ * assertDeviceAuthorization() in orchestrator.ts verifies the signature in
+ * the API process, not in bytecode. The server cannot forge a signature but
+ * it is the one checking, so this protects against a stolen session and a
+ * swapped payee, not against a compromised server.
  *
  * The key is encrypted at rest with a secret only the passkey can produce:
  * WebAuthn's PRF extension derives 32 bytes from the authenticator for a
  * fixed salt, HKDF turns that into an AES-GCM key, and only the ciphertext
- * touches localStorage. Face ID / fingerprint / screen lock is therefore a
- * real gate — without the authenticator the stored blob is inert, and every
- * payment needs a fresh ceremony to unwrap.
+ * touches localStorage. Without the authenticator the stored blob is useless,
+ * and every payment needs a fresh ceremony to unwrap.
  *
- * Not every authenticator supports PRF. When it isn't available we fall back
- * to storing the key unprotected and label it that way (`protection: "none"`)
- * rather than pretending — an unwrapped key is still enough to stop the
- * server spending, which is the FP4 property; it just doesn't survive someone
- * with access to this browser profile.
+ * The stored blob records its `protection`, which the app reads back.
  *
  * Crypto is vendored @noble/secp256k1 + @noble/hashes (audited, no build
  * step; see /vendor). Signing is RFC6979 deterministic with low-s enforced,
- * matching the contract's EIP-2 check.
+ * as ecrecover's EIP-2 check requires.
  */
 import { keccak_256 } from "./vendor/hashes/sha3.js";
 import * as secp from "./vendor/secp256k1.js";
 
 const KEY_SLOT = "zold-device-key";
-/** The slot this used to live in, before the Zoll -> Zold rename. The device
- *  key is bound on-chain via authorizerOf and only the CURRENT authorizer can
- *  rotate it, so losing this slot would leave an account permanently unable to
- *  spend. Read the old name once and carry it forward. */
+/** The slot from before the Zoll -> Zold rename. The device key is bound as
+ *  the account's authorizer and only the CURRENT authorizer can rotate it, so
+ *  dropping this slot would leave an account permanently unable to spend.
+ *  Read the old name once and carry it forward. */
 const LEGACY_KEY_SLOT = "zoll-device-key";
 /**
- * Fixed PRF input: same salt must yield the same wrapping key every time.
+ * Fixed PRF input: the same salt must yield the same wrapping key every time.
  *
- * DO NOT rename this string. It is not a label — it is an input to the key
- * derivation, so changing it derives a different AES key and every device key
- * already wrapped on a user's authenticator becomes undecryptable. It keeps the
- * old spelling through the Zoll -> Zold rename for exactly that reason; a new
- * spelling would need a versioned migration that unwraps with the old salt
- * first, not a search-and-replace.
+ * Don't rename this string. It is an input to the key derivation, so a change
+ * derives a different AES key and every device key already wrapped on a
+ * user's authenticator becomes undecryptable. That is why it keeps the old
+ * spelling after the Zoll -> Zold rename. A new spelling needs a versioned
+ * migration that unwraps with the old salt first.
  */
 const PRF_SALT = new TextEncoder().encode("zoll/device-key/v1");
 
@@ -66,7 +64,7 @@ const concat = (...arrs) => {
 /**
  * Recompute the destination commitment the server folded into the terms, from
  * the recipient the user actually entered. Signing only proceeds when this
- * matches the server's — so a server that swapped the IBAN/VPA/phone in the
+ * matches the server's — so a server that swapped the IBAN or phone in the
  * signed terms is caught here, before the passkey ever unlocks the key.
  * Covers the recipient NAME as well as the account identifier: on the cash rail
  * the name is what the anchor is told and what the collector presents with ID,
@@ -79,8 +77,6 @@ export function destinationCommitment(rail, target) {
   let preimage;
   if (rail === "sepa") {
     preimage = `sepa|iban=${(target.iban ?? "").replace(/\s/g, "").toUpperCase()}`;
-  } else if (rail === "upi") {
-    preimage = `upi|vpa=${(target.vpa ?? "").trim().toLowerCase()}`;
   } else {
     preimage = `cash|phone=${(target.phone ?? "").trim()}`;
   }
@@ -237,7 +233,7 @@ export async function deviceAddress(credentialId) {
   const blob = readSlot();
   if (!blob) return (await createKey(credentialId)).address;
   if (blob.address) return blob.address;
-  return addressOf(blob.key); // legacy plaintext blob with no cached address
+  return addressOf(blob.key); // pre-PRF plaintext blob with no cached address
 }
 
 /**
@@ -267,7 +263,33 @@ export async function signTypedData(typedData, credentialId) {
   return bytesToHex(concat(sig, Uint8Array.of(27 + recovery)));
 }
 
+const b64url = (buf) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+/**
+ * A user-verified passkey assertion over a challenge the server issued, in the
+ * shape the API takes for `executionAssertion` and `moneriumRedeemAssertion`.
+ * Undefined when there is nothing to approve (no challenge on this transfer).
+ */
+export async function passkeyAssertion(req) {
+  if (!req?.challenge || !req?.credentialId) return undefined;
+  const cred = await navigator.credentials.get({
+    publicKey: {
+      challenge: b64urlToBytes(req.challenge),
+      allowCredentials: [{ type: "public-key", id: b64urlToBytes(req.credentialId) }],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+  return {
+    credentialId: req.credentialId,
+    authenticatorData: b64url(cred.response.authenticatorData),
+    clientDataJSON: b64url(cred.response.clientDataJSON),
+    signature: b64url(cred.response.signature),
+  };
+}
+
 // Hand the API to the classic script, which loaded before this module.
 if (window.__deviceLibReady) {
-  window.__deviceLibReady({ createKey, deviceAddress, signTypedData, keyStatus, destinationCommitment });
+  window.__deviceLibReady({ createKey, deviceAddress, signTypedData, keyStatus, destinationCommitment, passkeyAssertion });
 }
