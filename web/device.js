@@ -193,7 +193,10 @@ const readSlot = () => {
   }
   if (!raw) return null;
   if (raw.startsWith("0x")) return { v: 1, protection: "none", key: raw }; // pre-PRF format
-  try { return JSON.parse(raw); } catch { return null; }
+  // A record that cannot be read is still a record: it may be a wrapped key the
+  // account is bound to. Report it as damaged rather than absent, so nothing
+  // mints a new key over it.
+  try { return JSON.parse(raw); } catch { return { damaged: true, protection: null }; }
 };
 const writeSlot = (blob) => localStorage.setItem(KEY_SLOT, JSON.stringify(blob));
 
@@ -209,29 +212,41 @@ const addressOf = (privHex) =>
 /** Is a device key already present in this browser, and how is it held? */
 export function keyStatus() {
   const blob = readSlot();
-  return { present: !!blob, protection: blob?.protection ?? null };
+  return { present: !!blob, protection: blob?.protection ?? null, ...(blob?.damaged ? { damaged: true } : {}) };
 }
 
 /**
  * Create the device key, wrapping it with the passkey when the authenticator
  * supports PRF. Returns the address plus how the key ended up protected, so
  * the caller can tell the user the truth.
+ *
+ * `requirePrf` (the checkout sets it) refuses instead of storing a key the
+ * passkey cannot protect: nothing is written, and the error says why. The
+ * default keeps the core's behaviour.
  */
-export async function createKey(credentialId) {
+export async function createKey(credentialId, { requirePrf = false } = {}) {
+  // Never over an existing key, readable or not: it may be the account's bound
+  // authorizer, and only the current authorizer can rotate it.
+  if (readSlot()) throw new Error("a spending key is already stored in this browser; it is not replaced");
   const privHex = freshPrivateKey();
   const secret = await prfSecret(credentialId);
   if (secret) {
     writeSlot({ ...(await wrapKey(privHex, secret)), address: addressOf(privHex) });
     return { address: addressOf(privHex), protection: "prf" };
   }
+  if (requirePrf) {
+    throw new Error("this device's authenticator does not support the PRF extension, so the spending key could not be protected");
+  }
   writeSlot({ v: 1, protection: "none", key: privHex, address: addressOf(privHex) });
   return { address: addressOf(privHex), protection: "none" };
 }
 
-/** The device address, without needing to unwrap (cached alongside the blob). */
-export async function deviceAddress(credentialId) {
+/** The device address, without needing to unwrap (cached alongside the blob).
+ *  With no key yet it makes one, with the same options as createKey. */
+export async function deviceAddress(credentialId, options = {}) {
   const blob = readSlot();
-  if (!blob) return (await createKey(credentialId)).address;
+  if (!blob) return (await createKey(credentialId, options)).address;
+  if (blob.damaged) throw new Error("the spending key stored in this browser is damaged");
   if (blob.address) return blob.address;
   return addressOf(blob.key); // pre-PRF plaintext blob with no cached address
 }
@@ -243,6 +258,7 @@ export async function deviceAddress(credentialId) {
 async function unlock(credentialId) {
   const blob = readSlot();
   if (!blob) throw new Error("no device key in this browser");
+  if (blob.damaged) throw new Error("the spending key stored in this browser is damaged");
   if (blob.protection !== "prf") return blob.key;
   const secret = await prfSecret(credentialId);
   if (!secret) throw new Error("your passkey is needed to approve this payment — the device key stays locked without it");

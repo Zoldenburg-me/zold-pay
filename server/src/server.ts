@@ -80,6 +80,21 @@ const credentialLimit = () => createRateLimiter({ windowMs, max: credential });
 // Sign-in is a guessing surface on the core too; give each its own tight bucket
 // before the request is proxied.
 for (const signInPath of ["/api/passkey/login", "/api/webauthn/challenge"]) app.use(signInPath, credentialLimit());
+// The front channel starts a checkout with only a merchant's public client id,
+// so the per-address limit alone lets many addresses open checkouts for one
+// merchant. Each merchant also gets one front-channel bucket across every
+// address. Only the front channel: the back channel needs the client secret, and
+// a flood on the public URL must not lock the merchant out of its own
+// authenticated checkouts. Unknown ids get no bucket (they are refused anyway),
+// so made-up ids cannot grow the table.
+const frontChannelMerchantLimit = createRateLimiter({
+  windowMs,
+  max: CONFIG.rateLimit.client,
+  keyOf: (req) => {
+    const clientId = req.query.client_id;
+    return isShortString(clientId) && store.findMerchantByClientId(clientId) ? clientId : undefined;
+  },
+});
 
 app.use(express.json({ limit: CONFIG.jsonBodyLimit }));
 
@@ -139,12 +154,14 @@ app.get("/bff/config", (_req, res) => {
   res.json({ publicOrigin: CONFIG.publicOrigin, appUrl: CONFIG.appUrl });
 });
 
+// Whether this service is up and can reach the core, and nothing else: what the
+// core says about itself (versions, paths, chain) is not for the public.
 app.get(
   "/bff/health",
   wrap(async (_req, res) => {
     try {
-      const upstream = await core("/api/health");
-      res.json({ ok: true, core: { reachable: true, ...upstream } });
+      await core("/api/health");
+      res.json({ ok: true, core: { reachable: true } });
     } catch {
       // No upstream error text: it can carry addresses and internals.
       res.status(503).json({ ok: false, core: { reachable: false } });
@@ -203,6 +220,7 @@ app.post(
 app.get(
   "/api/checkout/authorize",
   credentialLimit(),
+  frontChannelMerchantLimit,
   wrap(async (req, res) => {
     const q = req.query as Record<string, unknown>;
     const merchant = isShortString(q.client_id) ? store.findMerchantByClientId(q.client_id) : undefined;

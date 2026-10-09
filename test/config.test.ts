@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -96,6 +98,21 @@ describe("assertConfigSane", () => {
     assert.doesNotThrow(() => assertConfigSane({ ...cfg, environment: "development" as const }));
   });
 
+  it("stops on a malformed .env with one line naming the file and the line, not a stack trace", () => {
+    const entry = pathToFileURL(path.join(ROOT, "server/src/config.ts")).href;
+    const dir = mkdtempSync(path.join(tmpdir(), "pay-config-env-"));
+    const envFile = path.join(dir, "bad.env");
+    writeFileSync(envFile, "OK=1\nNOT A SETTING hunter2\n");
+    const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `await import(${JSON.stringify(entry)})`], {
+      cwd: ROOT, encoding: "utf8", env: { ...process.env, CHECKOUT_ENV_FILE: envFile },
+    });
+    rmSync(dir, { recursive: true, force: true });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /line 2: not KEY=value/);
+    assert.equal(r.stderr.includes("hunter2"), false);
+    assert.equal(/\n\s+at /.test(r.stderr), false, "no stack trace");
+  });
+
   it("refuses malformed numeric settings instead of silently turning a limit off", () => {
     const entry = pathToFileURL(path.join(ROOT, "server/src/config.ts")).href;
     for (const [name, value] of [
@@ -107,6 +124,7 @@ describe("assertConfigSane", () => {
       });
       assert.notEqual(r.status, 0, `${name}=${value} must stop the service from starting`);
       assert.match(r.stderr, new RegExp(name), `${name}=${value}`);
+      assert.equal(r.stderr.includes(`"${value}"`), false, `${name}: the error names the setting, never its value`);
     }
   });
 });

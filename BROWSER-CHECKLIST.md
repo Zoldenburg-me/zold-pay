@@ -42,7 +42,7 @@ identity check, Monerium) happens in the Zold app.
 | 2 | "Sign in and pay" | A real OS passkey prompt with **no username to type**. Not a hang. |
 | 3 | Approve it | Moves to "Preparing…"; the fee and total fill in |
 | 4 | *Only if the account has no spending key yet:* a **second** prompt | This is the step-up the core requires to bind a spending key (`authorizer.bind`). Skipped when a key is already bound. |
-| 5 | Check for an amber note | **Absent** on a PRF-capable authenticator. If it appears, the device key is stored unwrapped; note which authenticator. |
+| 5 | No refusal about PRF | On a PRF-capable authenticator the payment carries on. Without PRF the checkout now refuses to make a spending key ("…does not support the PRF extension…"); note which authenticator. |
 | 6 | Wait at "Approve on your device…" | Up to three prompts, in this order on a PRF authenticator: (a) unlock the device key to sign the terms, (b) approve the Safe debit, (c) approve the Monerium redeem. Each is its own ceremony. |
 | 7 | Approve all of them | "Payment sent", then a redirect to the merchant with `code` and `state` in the query |
 | 8 | In the Zold app | The transfer shows `PAYOUT_SUBMITTED`, then `PAID` |
@@ -53,7 +53,7 @@ identity check, Monerium) happens in the Zold app.
 Still unverified against a real authenticator, and it decides whether a wrapped
 key survives a reload:
 
-- **Is PRF offered at all?** If step 5 shows the amber note, no.
+- **Is PRF offered at all?** If step 5 refuses with the PRF message, no.
 - **Does it return the same 32 bytes every time?** After step 7, **reload the
   page and pay a second intent**. If the second payment fails to unlock the
   device key, PRF is not stable across ceremonies and the wrapped key is
@@ -123,3 +123,7 @@ stubs; this checks it for real, once.
 - **Embedded or private window.** Open the checkout inside an iframe or a
   browser that refuses Web Locks: pressing pay must say to use an up-to-date
   browser, and nothing is created.
+- **Unencrypted key from before.** In a browser that already holds an
+  unencrypted spending key (made before this change, or by the app without PRF),
+  pressing pay must say the key is unencrypted and point to the Zold app, before
+  any quote or transfer.

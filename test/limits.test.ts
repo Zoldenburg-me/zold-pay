@@ -59,3 +59,21 @@ describe("ipKey", () => {
     assert.equal(ipKey(undefined), "unknown");
   });
 });
+
+describe("createRateLimiter keyed on the merchant", () => {
+  /** 200 when the request went through, else the status the limiter answered. */
+  const statusOf = (limiter: ReturnType<typeof createRateLimiter>, ip: string, query: Record<string, string>) => {
+    let status = 200;
+    const res: any = { setHeader: () => res, status: (s: number) => ((status = s), res), json: () => res };
+    limiter({ ip, query, socket: { remoteAddress: ip } } as any, res, () => {});
+    return status;
+  };
+
+  it("counts every address of one merchant together, and leaves requests with no key to the other limits", () => {
+    const limit = createRateLimiter({ windowMs: 1000, max: 2, now: () => 0, keyOf: (req) => (req.query as any).client_id });
+    const statuses = ["1.1.1.1", "2.2.2.2", "3.3.3.3"].map((ip) => statusOf(limit, ip, { client_id: "shop" }));
+    assert.deepEqual(statuses, [200, 200, 429]);
+    for (let i = 0; i < 4; i++) assert.equal(statusOf(limit, "4.4.4.4", {}), 200, "no merchant named: not this limiter's business");
+    assert.equal(statusOf(limit, "1.1.1.1", { client_id: "other" }), 200);
+  });
+});

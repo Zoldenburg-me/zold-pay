@@ -141,7 +141,7 @@ describe("error handling", () => {
   });
 
   it("relays an unreachable core as 502 without leaking addresses", async () => {
-    const r = await call("/api/health");
+    const r = await call("/api/users/u1");
     assert.ok([502, 504].includes(r.status));
     assert.equal((await r.text()).includes("127.0.0.1"), false);
   });

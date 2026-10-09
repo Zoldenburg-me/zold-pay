@@ -151,9 +151,11 @@ The `demo-merchant` client is seeded only when `ALLOW_DEV_SHORTCUTS=1`. There is
    and target IBAN.
 2. **Details** — name, optional email, country.
 3. **Passkey** — `POST /api/users`, then `POST /api/users/:id/passkey` with the
-   attestation. Asks for the `prf` extension so the device key can be encrypted;
-   if the authenticator has no PRF, the page **says so** instead of implying the
-   key is protected.
+   attestation. Asks for the `prf` extension so the device key can be encrypted.
+   The checkout never uses an unencrypted device key: without PRF it refuses to
+   mint one (`createKey(..., { requirePrf: true })`), and a key already stored
+   unencrypted in this browser is refused before any money moves, pointing the
+   payer to the Zold app.
 4. **KYC** — `GET /api/users/:id/kyc`.
 5. **Device key** — generated in this browser by `device.js`, bound via
    `POST /api/users/:id/authorizer` with a step-up assertion.
@@ -413,11 +415,15 @@ None of this affects ADR 0001 stage 2 (passkey as a Safe owner). That is about
 ## Tests
 
 ```bash
-npm run check          # typecheck + the whole offline suite
+npm run check          # typecheck + the suite with an 80% coverage gate (offline)
+npm run gate           # check, then npm audit (needs the registry); run before a merge
 npm run harness:smoke  # against a running local core (see the script header)
 ```
 
-`npm run check` needs nothing else running. It covers: hashed credentials and
+`npm run check` needs nothing else running and no network.
+Coverage is measured for `server/src` (lines, branches and functions, each at
+least 80%); the page's inline script runs in the vm page tests but is not
+measured. It covers: hashed credentials and
 the store migration, constant-time comparison, input validation, rate limiting,
 security headers and the origin policy, the production fail-closed config, the
 proxy allowlist (including path tricks), the transfer checks, the merchant flow
@@ -510,6 +516,18 @@ never be refunded. A late payment on a checkout whose merchant never exchanged a
 code is visible to support and on the merchant's own statement (it carries the
 checkout's reference), not through the status API.
 
+**Each merchant's front channel has its own limit** (`RATE_LIMIT_CLIENT`, 60
+checkouts a minute across every address), on top of the per-address limits.
+The client id is public, so anyone can spend that budget and payers arriving
+through the unauthenticated `GET /authorize` URL get a 429 until the minute is
+over. That is the accepted trade: it bounds how many checkouts a flood can open,
+and the merchant's authenticated back channel (`POST /api/checkout/intents`) is
+never counted, so the merchant can always start checkouts itself.
+
+**`/bff/health` says only whether the core is reachable.** It no longer passes
+on what the core says about itself, and the core's own `/api/health` is not
+proxied.
+
 **Accepted for now.** Anyone with a Zold session and the checkout link can claim
 it and hold it until it expires (the link is an unguessable id given to the
 payer, and the merchant can start a new checkout). Attach checks the claim
@@ -528,7 +546,25 @@ finishes up to 10 minutes after the checkout's 15-minute window is still accepte
 
 ---
 
+## Upgrading to this version
+
+- **`.env` is strict.** A line Node's loader would skip or misread now stops
+  the service at start: no `KEY=value`, a key set twice (it used to be "last
+  wins"), an unclosed quote, a `#` inside an unquoted value, text after a closing
+  quote, a byte-order mark or a lone carriage return. The error names the file
+  and line numbers. Fix the line, or quote the value.
+- **Unencrypted spending keys are refused at checkout.** A payer whose browser
+  holds a key the passkey cannot protect (no PRF), or a damaged one, is told to
+  pay in the Zold app. Worth a line to merchants.
+- **`/bff/health` returns only `{ ok, core: { reachable } }`** and the core's
+  `/api/health` is no longer proxied.
+- **`npm run check` no longer runs `npm audit`**; `npm run gate` does. Node 22.8
+  or later is required (the coverage gate).
+
 ## Changes the core still needs
+
+- The `device.js` change described under *Layout*, so the checkout's copy and
+  the main repo's are identical again.
 
 - `RP_ID=zold.app` and both origins in `WEBAUTHN_ORIGINS`.
 - `TRUSTED_PROXY_HOPS` set to the real hop count.
@@ -549,12 +585,18 @@ server/src/checkout.ts  the authorization-server logic, ported from the core
 server/src/proxy.ts     the allowlist
 server/src/server.ts    checkout routes, /bff/* routes, proxy mount, static page
 web/checkout.html       the checkout + onboarding page
-web/device.js           VERBATIM copy from the main repo — see below
+web/device.js           copy of the main repo's services/api/public/device.js — see below
 web/vendor/             VERBATIM copy (noble secp256k1 + hashes)
 scripts/harness-smoke.ts  wiring check against a local core (refuses real money)
 ```
 
-`device.js` and `vendor/` are copied **verbatim** and must stay that way. The
+`device.js` and `vendor/` are copied **verbatim** and must stay that way.
+**Until the companion change lands in the main repo, `device.js` here is ahead
+of it**: `createKey`/`deviceAddress` take `{ requirePrf }`, a record that cannot
+be parsed is reported as `damaged` instead of absent, and `createKey` never
+writes over a stored key. The same change has to land in
+`services/api/public/device.js` so the two are identical again. The
+
 `PRF_SALT = "zoll/device-key/v1"` string and the legacy `zoll-*` localStorage
 slots keep the old spelling on purpose: the salt is an input to the key
 derivation, so a new spelling derives a different AES key and every already-
