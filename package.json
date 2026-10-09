@@ -3,13 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pay with Zold — hosted merchant checkout with inline new-user onboarding",
+  "description": "Pay with Zold — hosted merchant checkout for existing Zold users",
   "engines": { "node": ">=22" },
   "scripts": {
     "dev": "tsx watch server/src/server.ts",
     "start": "tsx server/src/server.ts",
     "typecheck": "tsc --noEmit",
-    "onboard:test": "tsx scripts/onboard-test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "harness:smoke": "tsx scripts/harness-smoke.ts"
   },
   "dependencies": {
     "express": "^4.21.2"
