@@ -405,8 +405,15 @@ function assertUsableKey(dev) {
 }
 
 async function ensureDeviceKey() {
-  if (await keyBelongsToAnotherAccount()) throw new Error(SHARED_KEY_REFUSAL);
   const dev = await deviceLib;
+  // A damaged record on an account with no key bound cannot be its key: replace it.
+  // With a key bound it may be that key, so it is refused (assertUsableKey).
+  const replaceDamaged = !!dev.keyStatus().damaged && !user.authorizerAddress;
+  if (replaceDamaged) {
+    const { address } = await dev.createKey(credId(), { ...STRICT_KEY, replaceDamaged: true });
+    return bindDeviceKey(address);
+  }
+  if (await keyBelongsToAnotherAccount()) throw new Error(SHARED_KEY_REFUSAL);
   // The checkout never uses a spending key that sits unencrypted in the browser:
   // anyone with this browser's storage could sign with it. Refused before any
   // money can move, and never minted here (requirePrf).
@@ -415,6 +422,11 @@ async function ensureDeviceKey() {
   const { address } = dev.keyStatus().present
     ? { address: await dev.deviceAddress(credId(), STRICT_KEY) }
     : await dev.createKey(credId(), STRICT_KEY);
+  await bindDeviceKey(address);
+}
+
+/* Bind `address` as the account's spending key, behind a passkey step-up. */
+async function bindDeviceKey(address) {
   const updated = await api(`/api/users/${user.id}/authorizer`, { address, stepUp: await passkeyStepUp("authorizer.bind") });
   localStorage.setItem(KEY_OWNER_SLOT, user.id);
   if (updated.authorizerAddress) user = { ...user, authorizerAddress: updated.authorizerAddress };

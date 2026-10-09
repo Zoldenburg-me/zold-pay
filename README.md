@@ -594,7 +594,8 @@ scripts/harness-smoke.ts  wiring check against a local core (refuses real money)
 **Until the companion change lands in the main repo, `device.js` here is ahead
 of it**: `createKey`/`deviceAddress` take `{ requirePrf }`, a record that cannot
 be parsed is reported as `damaged` instead of absent, and `createKey` never
-writes over a stored key. The same change has to land in
+writes over a stored key, except a damaged one when the caller passes
+`replaceDamaged` (the account has no key bound, so it cannot be its key). The same change has to land in
 `services/api/public/device.js` so the two are identical again. The
 
 `PRF_SALT = "zoll/device-key/v1"` string and the legacy `zoll-*` localStorage
