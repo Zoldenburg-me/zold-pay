@@ -121,6 +121,19 @@ const intentId = new URLSearchParams(location.search).get("intent");
 let sessionToken = sessionStorage.getItem("zold-checkout-session") || null;
 let user = null, intent = null;
 
+/* The transfer this browser made for this checkout, kept from the moment the
+   payment is authorized until the merchant has been told. By then the money has
+   moved: if telling the merchant fails, the only safe next step is to tell them
+   again, never to pay again. It is a transfer id, not a secret. */
+const TRANSFER_KEY = `zold-checkout-transfer:${intentId}`;
+const rememberTransfer = (id) => sessionStorage.setItem(TRANSFER_KEY, id);
+const rememberedTransfer = () => sessionStorage.getItem(TRANSFER_KEY);
+const forgetTransfer = () => sessionStorage.removeItem(TRANSFER_KEY);
+const ATTACH_ATTEMPTS = 8;      // a payout that is still settling is waited for,
+const ATTACH_WAIT_MS = 2500;    // roughly 20 seconds in all
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DO_NOT_PAY_AGAIN = "Your payment was sent. Do not pay again";
+
 async function request(path, body) {
   const headers = {};
   if (body) headers["content-type"] = "application/json";
@@ -129,7 +142,13 @@ async function request(path, body) {
   const text = await res.text();
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text.slice(0, 300) }; }
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const err = new Error(data.error || res.statusText);
+    err.status = res.status;
+    // The server marks a refusal that asking again can fix (a payout still settling).
+    err.retryable = data.retryable === true;
+    throw err;
+  }
   return data;
 }
 const api = (p, b) => request(p, b);
@@ -142,6 +161,10 @@ const credId = () => user?.passkey?.credentialId || null;
 function show(...ids) {
   for (const id of ["load","pay","result"]) $(id).classList.add("hidden");
   for (const id of ids) $(id).classList.remove("hidden");
+}
+function setLabel(btn, label) {
+  btn.dataset.label = label;
+  btn.textContent = label;
 }
 function busy(btn, label) {
   btn.disabled = true;
@@ -172,12 +195,36 @@ async function load() {
   if (cfg.appUrl) { $("link-new").href = cfg.appUrl; $("link-new").classList.remove("hidden"); }
   try { intent = await api(`/api/checkout/intents/${encodeURIComponent(intentId)}`); }
   catch { $("load").textContent = "This checkout could not be loaded."; return; }
-  if (intent.expired) return result(false, "Checkout expired", "Ask the merchant to start again.");
-  if (intent.status === "PAID") return result(true, "Already paid", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`);
   $("amt").textContent = fmt(intent.amountEur);
   $("merchant").textContent = intent.merchant || "the merchant";
+  // A payment made from this browser that the merchant has not been told about.
+  // Whatever the checkout's status says, the pay form is never offered again: the
+  // only thing left to do is confirm it.
+  if (rememberedTransfer()) {
+    $("head").classList.remove("hidden");
+    setLabel($("btn-pay"), "Confirm with merchant");
+    showNote(`${DO_NOT_PAY_AGAIN} — confirm it with the merchant below.`);
+    return show("pay");
+  }
+  // Only an open checkout can be paid. Anything else is a dead end, not a form:
+  // paying a checkout that cannot accept the payment moves real money for nothing.
+  if (intent.status === "AUTHORIZED" || intent.status === "PAID") {
+    return result(true, "Already paid", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`);
+  }
+  if (intent.status !== "PENDING") return result(false, "This checkout can't be paid", "Ask the merchant to start again.");
+  if (intent.expired) return result(false, "Checkout expired", "Ask the merchant to start again.");
   $("head").classList.remove("hidden");
   show("pay");
+}
+
+/* Look again, right before any money can move: the checkout may have been paid in
+   another tab, or run out, since this page loaded. */
+async function assertStillOpen() {
+  const fresh = await api(`/api/checkout/intents/${encodeURIComponent(intentId)}`);
+  if (fresh.status !== "PENDING" || fresh.expired) {
+    throw new Error("This checkout is no longer open. Ask the merchant to start again.");
+  }
+  intent = fresh;
 }
 
 /* ---------- WebAuthn ---------- */
@@ -262,21 +309,27 @@ async function ensureDeviceKey() {
 async function quoteForMerchant() {
   const probe = await api("/api/quotes", { userId: user.id, rail: "sepa", sendEur: intent.amountEur });
   const fee = Math.round((probe.sendEur - probe.receiveEur) * 100) / 100;
-  const quote = await api("/api/quotes", { userId: user.id, rail: "sepa", sendEur: intent.amountEur + fee });
+  const quote = await api("/api/quotes", { userId: user.id, rail: "sepa", sendEur: Math.round((intent.amountEur + fee) * 100) / 100 });
   return { quote, fee };
 }
 
-async function payAndAttach(quote) {
+/* Steps 1-4: propose, sign, approve, authorize. Returns the id of the transfer, which
+   from this point has moved money. Telling the merchant (step 5) is separate, so
+   a failure there can never lead back into this function and pay a second time. */
+async function authorizePayment(quote) {
   const recipient = { recipientName: intent.merchant || "Merchant", recipientIban: intent.merchantIban };
-  // 1. Propose. The merchant's own reference rides on the SEPA payment, so the
-  //    money arrives on their statement tied to their order, and the attach
-  //    step checks it matches. Not covered by the signed destination commitment:
-  //    it decides what the payee reads, not who gets paid.
+  if (!intent.transferReference) throw new Error("this checkout link is out of date — ask the merchant to start again");
+  // 1. Propose. The payment carries this checkout's own reference: the merchant's
+  //    (so the money lands on their statement tied to their order) plus a part
+  //    unique to this checkout, so the attach step can only ever match a payment
+  //    made FOR it. Not covered by the signed destination commitment: it decides
+  //    what the payee reads, not who gets paid.
   const created = await api("/api/transfers", {
     quoteId: quote.id,
     ...recipient,
-    ...(intent.reference ? { reference: intent.reference } : {}),
+    reference: intent.transferReference,
   });
+  if (!created.id) throw new Error("the server did not return a transfer — nothing was sent");
 
   // 2. Device key: sign the exact terms.
   const dev = await deviceLib;
@@ -303,15 +356,42 @@ async function payAndAttach(quote) {
   const redeem = await dev.passkeyAssertion(created.authorization.moneriumRedeem);
 
   // 4. Authorize.
-  const t = await api(`/api/transfers/${created.id}/authorize`, {
+  await api(`/api/transfers/${created.id}/authorize`, {
     signature,
     ...(execution ? { executionAssertion: execution } : {}),
     ...(redeem ? { moneriumRedeemAssertion: redeem } : {}),
   });
+  return created.id;
+}
 
-  // 5. Attach. The intent view calls this field `intentId`, not `id`.
-  const { redirectUrl } = await api(`/api/checkout/intents/${intentId}/attach`, { transferId: t.id });
-  return redirectUrl;
+/* Step 5: tell the merchant, which mints their one-time code. A payout that has not
+   settled yet answers "retryable", so wait for it; every other refusal is final.
+   Safe to repeat for the same transfer until the merchant has the code. */
+async function confirmWithMerchant(transferId) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const { redirectUrl } = await api(`/api/checkout/intents/${encodeURIComponent(intentId)}/attach`, { transferId });
+      return redirectUrl;
+    } catch (e) {
+      if (!e.retryable || attempt >= ATTACH_ATTEMPTS) throw e;
+      await sleep(ATTACH_WAIT_MS);
+    }
+  }
+}
+
+async function confirmAndFinish(transferId) {
+  let redirectUrl;
+  try {
+    redirectUrl = await confirmWithMerchant(transferId);
+  } catch (e) {
+    // The merchant already has this payment: nothing left to do.
+    if (e.message === "checkout already completed") {
+      forgetTransfer();
+      return result(true, "Already paid", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`);
+    }
+    throw e;
+  }
+  finish(redirectUrl);
 }
 
 function finish(redirectUrl) {
@@ -319,6 +399,7 @@ function finish(redirectUrl) {
   // https (or plain http on this machine, for local runs).
   sessionStorage.removeItem("zold-checkout-session");
   sessionToken = null;
+  forgetTransfer();
   let target = null;
   try { target = new URL(redirectUrl, location.origin); } catch { /* handled below */ }
   const local = target && ["localhost", "127.0.0.1", "[::1]"].includes(target.hostname);
@@ -333,13 +414,21 @@ function finish(redirectUrl) {
 $("btn-pay").onclick = async () => {
   clearErr();
   const btn = $("btn-pay");
-  busy(btn, "Signing in…");
+  const remembered = rememberedTransfer();
+  busy(btn, remembered ? "Confirming…" : "Signing in…");
   try {
+    // A payment from this browser the merchant has not been told about: only tell
+    // them. Nothing below this block, which can move money, runs.
+    if (remembered) {
+      if (!sessionToken) await signIn();
+      return await confirmAndFinish(remembered);
+    }
     if (!user) await signIn();
     const me = await api(`/api/users/${user.id}`);
     user = { ...user, ...me };
     assertReady(user);
     busy(btn, "Preparing…");
+    await assertStillOpen();
     await ensureDeviceKey();
     const { quote, fee } = await quoteForMerchant();
     $("fee").textContent = fmt(fee);
@@ -350,9 +439,20 @@ $("btn-pay").onclick = async () => {
       throw new Error(`Not enough balance (${fmt(available)}). Top up in the Zold app, then return here.`);
     }
     busy(btn, "Approve on your device…");
-    finish(await payAndAttach(quote));
+    const transferId = await authorizePayment(quote);
+    // From here the money has moved. Remember it before anything else can fail.
+    rememberTransfer(transferId);
+    busy(btn, "Confirming with the merchant…");
+    await confirmAndFinish(transferId);
   } catch (e) {
-    showErr(e);
+    if (rememberedTransfer()) {
+      // Paid, but the merchant has not been told. Say so, and make the next click
+      // a confirmation, never another payment.
+      showErr(new Error(`${DO_NOT_PAY_AGAIN}. We couldn't confirm it with the merchant yet: ${e.message}. Press “Confirm with merchant” to try again.`));
+      setLabel(btn, "Confirm with merchant");
+    } else {
+      showErr(e);
+    }
     idle(btn);
   }
 };
