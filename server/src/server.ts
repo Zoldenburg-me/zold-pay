@@ -5,15 +5,17 @@
  * API is the source of truth, and this process serves the checkout origin and
  * forwards an allowlisted set of calls to it.
  *
- * Why it is a separate origin at all: passkeys are scoped to a relying-party
- * id and the FP4 device key lives in one origin's localStorage. A user who
- * onboards here gets both created here, which is the only combination that is
- * self-consistent. See README §"Origins and the RP ID".
+ * Passkeys are scoped to a relying-party id and the device key lives in one
+ * origin's localStorage, so the checkout page, its API and the account app have
+ * to agree on one origin. See README §"Origins and the RP ID" and ADR 0001.
  */
 import express from "express";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CheckoutError,
+  assertNoWildcardRedirects,
   attachTransfer,
   clientSecretMatches,
   createIntent,
@@ -27,19 +29,51 @@ import {
 } from "./checkout.js";
 import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled } from "./config.js";
 import { core, type CoreError } from "./core.js";
+import { createErrorHandler } from "./errors.js";
+import { createRateLimiter } from "./limits.js";
 import { proxy } from "./proxy.js";
+import { addNoncePlaceholders, fillNonce, newNonce, originPolicy, pageCsp, securityHeaders } from "./security.js";
 import { initStore, store } from "./store.js";
+import { isId, parseIntentInput } from "./validate.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
+const MAX_FIELD = 512;
 
 assertConfigSane();
 initStore();
-// Seed a demo merchant only where the demo shortcuts are on, so the flow is
-// exercisable without a real partner. A hosted deploy gets no default client.
+// A hosted deployment must not carry the demo's wildcard redirect.
+if (CONFIG.production) assertNoWildcardRedirects(store.allMerchants());
+// Drop abandoned checkouts and expired payer names now and every minute, so
+// neither depends on a restart.
+store.sweep();
+setInterval(() => store.sweep(), 60_000).unref();
+// Seed a demo merchant only where explicitly asked for and the core is on
+// loopback, so the flow is exercisable without a real partner.
 if (devShortcutsEnabled()) seedDemoMerchant(process.env.CHECKOUT_DEMO_IBAN);
+
+const parseOpts = {
+  maxAmountEur: CONFIG.maxAmountEur,
+  allowInsecureLoopback: !CONFIG.production && coreIsLoopback(),
+};
 
 export const app = express();
 app.disable("x-powered-by");
+// Honest client addresses for rate limiting: trust only the hops we were told about.
+app.set("trust proxy", CONFIG.trustedProxyHops ?? false);
+app.use(securityHeaders(CONFIG.production));
+app.use(originPolicy(CONFIG.publicOrigin));
+
+const { windowMs, general, credential } = CONFIG.rateLimit;
+const generalLimit = createRateLimiter({ windowMs, max: general });
+app.use("/api", generalLimit);
+app.use("/bff", generalLimit);
+// Credential-guessing surfaces get a tight bucket each, so one noisy route
+// cannot starve another.
+const credentialLimit = () => createRateLimiter({ windowMs, max: credential });
+// Sign-in is a guessing surface on the core too; give each its own tight bucket
+// before the request is proxied.
+for (const signInPath of ["/api/passkey/login", "/api/webauthn/challenge"]) app.use(signInPath, credentialLimit());
+
 app.use(express.json({ limit: CONFIG.jsonBodyLimit }));
 
 const wrap =
@@ -52,14 +86,17 @@ const bearer = (req: express.Request) => {
   return h.startsWith("Bearer ") ? h.slice(7) : undefined;
 };
 
+const isShortString = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= MAX_FIELD;
+
+function relayCoreError(err: unknown, res: express.Response) {
+  const e = err as CoreError;
+  if (typeof e?.status === "number") return res.status(e.status).json({ error: e.message });
+  res.status(502).json({ error: "could not reach the Zold API" });
+}
+
 /** What the browser needs to know about how this deployment is configured. */
 app.get("/bff/config", (_req, res) => {
-  res.json({
-    publicOrigin: CONFIG.publicOrigin,
-    // The RP ID is the core's (SECURITY.rpId) and comes back on every
-    // /api/webauthn/challenge response — the client uses that, not this.
-    devShortcuts: devShortcutsEnabled(),
-  });
+  res.json({ publicOrigin: CONFIG.publicOrigin, appUrl: CONFIG.appUrl });
 });
 
 app.get(
@@ -68,148 +105,55 @@ app.get(
     try {
       const upstream = await core("/api/health");
       res.json({ ok: true, core: { reachable: true, ...upstream } });
-    } catch (err: any) {
-      res.status(503).json({ ok: false, core: { reachable: false, error: err?.message ?? String(err) } });
-    }
-  }),
-);
-
-// --- Dev-only shortcuts ------------------------------------------------------
-// These reach core endpoints the proxy deliberately does not expose. They exist
-// because the core refuses its /api/simulate/* routes for any request carrying
-// a forwarding header, so the browser can never reach them through the proxy —
-// only this process can, from loopback. Both are gated on ALLOW_DEV_SHORTCUTS
-// *and* a loopback core, and both still require the caller's own session, so
-// they act on the signed-in account and no other.
-
-function requireDevShortcuts(res: express.Response): boolean {
-  if (!devShortcutsEnabled()) {
-    res.status(403).json({
-      error: coreIsLoopback()
-        ? "dev shortcuts are disabled — set ALLOW_DEV_SHORTCUTS=1 for local runs"
-        : "dev shortcuts are local-only and the configured Zold API is not loopback",
-    });
-    return false;
-  }
-  return true;
-}
-
-function relayCoreError(err: unknown, res: express.Response) {
-  const e = err as CoreError;
-  if (typeof e?.status === "number") return res.status(e.status).json({ error: e.message });
-  res.status(502).json({ error: "could not reach the Zold API" });
-}
-
-/** Local demo: approve this account's KYC through the core's mock review. */
-app.post(
-  "/bff/dev/kyc-approve",
-  wrap(async (req, res) => {
-    if (!requireDevShortcuts(res)) return;
-    const token = bearer(req);
-    if (!token) return res.status(401).json({ error: "authorization required" });
-    const userId = req.body?.userId;
-    if (typeof userId !== "string" || !userId) return res.status(400).json({ error: "userId required" });
-    try {
-      res.json(
-        await core(`/api/users/${encodeURIComponent(userId)}/kyc/mock-review`, {
-          body: { decision: "approved" },
-          sessionToken: token,
-        }),
-      );
-    } catch (err) {
-      relayCoreError(err, res);
-    }
-  }),
-);
-
-/** Local demo: credit a simulated SEPA deposit so a new account has a balance. */
-app.post(
-  "/bff/dev/fund",
-  wrap(async (req, res) => {
-    if (!requireDevShortcuts(res)) return;
-    const token = bearer(req);
-    if (!token) return res.status(401).json({ error: "authorization required" });
-    const { iban, amountEur } = req.body ?? {};
-    if (!iban || !(Number(amountEur) > 0)) {
-      return res.status(400).json({ error: "iban and a positive amountEur required" });
-    }
-    try {
-      res.json(
-        await core("/api/simulate/sepa-deposit", {
-          body: { iban, amountEur: Number(amountEur) },
-          sessionToken: token,
-        }),
-      );
-    } catch (err) {
-      relayCoreError(err, res);
+    } catch {
+      // No upstream error text: it can carry addresses and internals.
+      res.status(503).json({ ok: false, core: { reachable: false } });
     }
   }),
 );
 
 // --- "Pay with Zold" checkout (the merchant OAuth handoff) -------------------
-// This service is the authorization server. These routes were in the core app
-// until PR #68 extracted the checkout product here; the core no longer serves
-// /api/checkout/* at all. They are declared before the proxy so they are
-// answered locally rather than forwarded.
+// This service is the authorization server. These routes are declared before
+// the proxy so they are answered locally rather than forwarded.
 
 /**
  * Back channel: the merchant POSTs the payment details with its client secret
  * and gets an intent id, then redirects the user to the returned URL.
  *
- * This exists so a merchant can name WHICH of its settlement accounts to be
- * paid into. `client_id` is public and the front-channel GET below needs no
- * secret, so a destination chosen in a URL would let anyone who has seen a
- * checkout link mint one that looks like the merchant and pays an account of
- * their choosing. Authenticating the call is what makes a per-transaction
- * destination safe; the allowlist is what keeps it safe if the secret leaks.
+ * Authenticating the call is what makes a per-transaction destination safe;
+ * the merchant's IBAN allowlist is what keeps it safe if the secret leaks.
  */
 app.post(
   "/api/checkout/intents",
+  credentialLimit(),
   wrap(async (req, res) => {
     const b = req.body ?? {};
-    const merchant = b.client_id ? store.findMerchantByClientId(String(b.client_id)) : undefined;
+    const merchant = typeof b.client_id === "string" ? store.findMerchantByClientId(b.client_id) : undefined;
     // Same error for unknown client and wrong secret: the back channel should
     // not confirm which client ids exist.
     if (!merchant || !clientSecretMatches(merchant, b.client_secret)) {
       return res.status(401).json({ error: "bad client credentials" });
     }
-    if (!b.redirect_uri || !redirectAllowed(merchant, String(b.redirect_uri))) {
+    const parsed = parseIntentInput(b, parseOpts);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (!redirectAllowed(merchant, parsed.value.redirectUri)) {
       return res.status(400).json({ error: "redirect_uri not allowed for this client" });
     }
-    const amountEur = Number(b.amount);
-    if (!(amountEur > 0)) return res.status(400).json({ error: "positive amount required" });
-    if (!b.code_challenge || (b.code_challenge_method ?? "S256") !== "S256") {
-      return res.status(400).json({ error: "S256 code_challenge required" });
-    }
-    const reference = String(b.reference ?? "");
-    // The reference is echoed to the merchant and is destined for the SEPA
-    // remittance field, which is 140 characters. Refuse rather than silently
-    // truncate the thing they reconcile on.
-    if (reference.length > 140) {
-      return res.status(400).json({ error: "reference must be 140 characters or fewer" });
-    }
-    let intent;
     try {
-      intent = createIntent(merchant, {
-        amountEur,
-        reference,
-        redirectUri: String(b.redirect_uri),
-        state: String(b.state ?? ""),
-        codeChallenge: String(b.code_challenge),
-        destinationIban: b.destination_iban ? String(b.destination_iban) : undefined,
+      const intent = createIntent(merchant, parsed.value);
+      res.status(201).json({
+        intentId: intent.id,
+        checkoutUrl: `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`,
+        merchant: merchant.name,
+        amountEur: intent.amountEur,
+        destinationIban: intent.destinationIban,
+        reference: intent.reference,
+        expiresAt: new Date(Date.parse(intent.createdAt) + 15 * 60_000).toISOString(),
       });
-    } catch (e: any) {
-      return res.status(400).json({ error: String(e?.message ?? e) });
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(400).json({ error: e.message });
+      throw e;
     }
-    res.status(201).json({
-      intentId: intent.id,
-      checkoutUrl: `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`,
-      merchant: merchant.name,
-      amountEur: intent.amountEur,
-      destinationIban: intent.destinationIban,
-      reference: intent.reference,
-      expiresAt: new Date(Date.parse(intent.createdAt) + 15 * 60_000).toISOString(),
-    });
   }),
 );
 
@@ -218,18 +162,11 @@ app.post(
 // destination — see the back channel above.
 app.get(
   "/api/checkout/authorize",
+  credentialLimit(),
   wrap(async (req, res) => {
-    const q = req.query as Record<string, string>;
-    const merchant = q.client_id ? store.findMerchantByClientId(q.client_id) : undefined;
+    const q = req.query as Record<string, unknown>;
+    const merchant = isShortString(q.client_id) ? store.findMerchantByClientId(q.client_id) : undefined;
     if (!merchant) return res.status(400).json({ error: "unknown client_id" });
-    if (!q.redirect_uri || !redirectAllowed(merchant, q.redirect_uri)) {
-      return res.status(400).json({ error: "redirect_uri not allowed for this client" });
-    }
-    const amountEur = Number(q.amount);
-    if (!(amountEur > 0)) return res.status(400).json({ error: "positive amount required" });
-    if (!q.code_challenge || (q.code_challenge_method ?? "S256") !== "S256") {
-      return res.status(400).json({ error: "S256 code_challenge required" });
-    }
     if (q.destination_iban) {
       return res.status(400).json({
         error:
@@ -237,24 +174,23 @@ app.get(
           "use POST /api/checkout/intents with your client secret",
       });
     }
-    if ((q.reference ?? "").length > 140) {
-      return res.status(400).json({ error: "reference must be 140 characters or fewer" });
+    const parsed = parseIntentInput(q, parseOpts);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    if (!redirectAllowed(merchant, parsed.value.redirectUri)) {
+      return res.status(400).json({ error: "redirect_uri not allowed for this client" });
     }
-    const intent = createIntent(merchant, {
-      amountEur,
-      reference: q.reference ?? "",
-      redirectUri: q.redirect_uri,
-      state: q.state ?? "",
-      codeChallenge: q.code_challenge,
-    });
-    // Absolute, unlike the core's old relative URL: the merchant redirects the
-    // user here from its own origin, so a path alone would resolve against the
-    // wrong host.
-    const checkoutUrl = `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`;
-    if ((req.header("accept") ?? "").includes("application/json")) {
-      return res.status(201).json({ intentId: intent.id, checkoutUrl, merchant: merchant.name, amountEur });
+    try {
+      const intent = createIntent(merchant, parsed.value);
+      // Absolute: the merchant redirects the user here from its own origin.
+      const checkoutUrl = `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`;
+      if ((req.header("accept") ?? "").includes("application/json")) {
+        return res.status(201).json({ intentId: intent.id, checkoutUrl, merchant: merchant.name, amountEur: intent.amountEur });
+      }
+      res.redirect(checkoutUrl);
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(400).json({ error: e.message });
+      throw e;
     }
-    res.redirect(checkoutUrl);
   }),
 );
 
@@ -262,6 +198,7 @@ app.get(
 // paid and how much. No auth — it's a redirect target the user just landed on.
 app.get(
   "/api/checkout/intents/:id",
+  credentialLimit(),
   wrap(async (req, res) => {
     const intent = store.findPaymentIntent(req.params.id);
     if (!intent) return res.status(404).json({ error: "unknown checkout" });
@@ -279,44 +216,38 @@ app.get(
 );
 
 // The user links the transfer they just authorized into the merchant's IBAN,
-// minting the one-time code and the redirect back.
-//
-// The core app could read the transfer from its own store and check the
-// session against it. We read it back from the core API with the caller's own
-// bearer instead — which is the same proof: a transfer another user owns is
-// not readable with this session, so a 403/404 upstream is the answer.
+// minting the one-time code and the redirect back. The transfer is read back
+// from the core API with the caller's own bearer: a transfer another user owns
+// is not readable with this session, so a 403/404 upstream is the answer.
 app.post(
   "/api/checkout/intents/:id/attach",
+  credentialLimit(),
   wrap(async (req, res) => {
     const intent = store.findPaymentIntent(req.params.id);
     if (!intent) return res.status(404).json({ error: "unknown checkout" });
     const token = bearer(req);
     if (!token) return res.status(401).json({ error: "authorization required" });
     const transferId = req.body?.transferId;
-    if (typeof transferId !== "string" || !transferId) {
-      return res.status(400).json({ error: "transferId required" });
-    }
+    // It becomes a path segment on the core API, so it must be a plain id.
+    if (!isId(transferId)) return res.status(400).json({ error: "transferId required" });
     let transfer: CoreTransfer;
     let payerName: string | undefined;
     try {
-      transfer = await core<CoreTransfer>(`/api/transfers/${encodeURIComponent(transferId)}`, {
+      transfer = await core<CoreTransfer>(`/api/transfers/${encodeURIComponent(transferId)}`, { sessionToken: token });
+      // Read with the CALLER's session, so we can only ever learn the name of
+      // the person actually completing this checkout.
+      const payer = await core<{ name?: string }>(`/api/users/${encodeURIComponent(transfer.userId)}`, {
         sessionToken: token,
       });
-      // The merchant is granted the payer's legal name so it can evidence a
-      // first-party top-up. Read with the CALLER's session, so we can only ever
-      // learn the name of the person actually completing this checkout.
-      const payer = await core<{ name?: string }>(
-        `/api/users/${encodeURIComponent(transfer.userId)}`,
-        { sessionToken: token },
-      );
       payerName = typeof payer?.name === "string" ? payer.name : undefined;
     } catch (err) {
       return relayCoreError(err, res);
     }
     try {
       res.json(attachTransfer(intent, transfer.userId, transfer, payerName));
-    } catch (e: any) {
-      res.status(400).json({ error: String(e?.message ?? e) });
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(400).json({ error: e.message });
+      throw e;
     }
   }),
 );
@@ -325,15 +256,17 @@ app.post(
 // → status + a bearer for polling. Burns the code.
 app.post(
   "/api/checkout/token",
+  credentialLimit(),
   wrap(async (req, res) => {
     const { client_id, client_secret, code, code_verifier } = req.body ?? {};
-    if (!client_id || !client_secret || !code || !code_verifier) {
+    if (![client_id, client_secret, code, code_verifier].every(isShortString)) {
       return res.status(400).json({ error: "client_id, client_secret, code and code_verifier required" });
     }
     try {
       res.json(exchangeCode(client_id, client_secret, code, code_verifier));
-    } catch (e: any) {
-      res.status(400).json({ error: String(e?.message ?? e) });
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(400).json({ error: e.message });
+      throw e;
     }
   }),
 );
@@ -341,13 +274,15 @@ app.post(
 // Merchant status polling with the exchange bearer.
 app.get(
   "/api/checkout/status/:id",
+  credentialLimit(),
   wrap(async (req, res) => {
     const tok = bearer(req);
     if (!tok) return res.status(401).json({ error: "authorization required" });
     try {
       res.json(statusByToken(req.params.id, tok));
-    } catch (e: any) {
-      res.status(404).json({ error: String(e?.message ?? e) });
+    } catch (e) {
+      if (e instanceof CheckoutError) return res.status(404).json({ error: e.message });
+      throw e;
     }
   }),
 );
@@ -363,11 +298,19 @@ app.use((req, res, next) => {
 
 // --- Static checkout UI ------------------------------------------------------
 
-// The core's /api/checkout/authorize hands back a relative "/checkout.html?intent=…".
-// Serve the page at both spellings so that URL resolves against this origin too.
-const page: express.Handler = (_req, res) => res.sendFile(path.join(WEB, "checkout.html"));
+// The page's inline script and style carry a per-response nonce, so the CSP can
+// refuse every other inline script. The template is read once at startup.
+const pageTemplate = addNoncePlaceholders(readFileSync(path.join(WEB, "checkout.html"), "utf8"));
+const page: express.Handler = (_req, res) => {
+  const nonce = newNonce();
+  res.setHeader("Content-Security-Policy", pageCsp(nonce));
+  // Never cached: the body carries a nonce that is only valid for this response.
+  res.setHeader("Cache-Control", "no-store");
+  res.type("html").send(fillNonce(pageTemplate, nonce));
+};
 app.get("/", page);
 app.get("/checkout", page);
+app.get("/checkout.html", page);
 
 app.use(
   express.static(WEB, {
@@ -375,26 +318,20 @@ app.use(
     setHeaders(res, filePath) {
       // device.js and the vendored crypto are the security-relevant assets;
       // don't let a stale copy linger in a cache we cannot bust.
-      if (filePath.endsWith(".js") || filePath.endsWith(".html")) {
-        res.setHeader("cache-control", "no-cache");
-      }
+      if (filePath.endsWith(".js")) res.setHeader("cache-control", "no-cache");
     },
   }),
 );
 
 app.use((_req, res) => res.status(404).json({ error: "not found" }));
-
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use(((err, _req, res, _next) => {
-  console.error(err);
-  res.status(500).json({ error: "checkout service error" });
-}) as express.ErrorRequestHandler);
+app.use(createErrorHandler());
 
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   app.listen(CONFIG.port, () => {
     console.log(`Pay with Zold checkout on http://localhost:${CONFIG.port}`);
     console.log(`  core API      ${CONFIG.coreApiUrl}`);
     console.log(`  public origin ${CONFIG.publicOrigin}`);
-    console.log(`  dev shortcuts ${devShortcutsEnabled() ? "ENABLED (simulated KYC + deposits)" : "off"}`);
+    console.log(`  mode          ${CONFIG.production ? "production" : "development"}`);
+    console.log(`  demo merchant ${devShortcutsEnabled() ? "seeded (local only)" : "off"}`);
   });
 }

@@ -41,6 +41,7 @@ export async function core<T = any>(path: string, opts: CoreCallOptions = {}): P
     method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    redirect: "manual",
     signal: AbortSignal.timeout(CONFIG.coreTimeoutMs),
   });
 
