@@ -15,25 +15,27 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CheckoutError,
+  CoreResponseError,
   assertNoWildcardRedirects,
   attachTransfer,
   clientSecretMatches,
   createIntent,
   exchangeCode,
   isIntentExpired,
+  parseCoreTransfer,
   redirectAllowed,
   seedDemoMerchant,
   statusByToken,
   statusView,
-  type CoreTransfer,
+  transferReference,
 } from "./checkout.js";
-import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled } from "./config.js";
+import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled, originIsLoopback } from "./config.js";
 import { core, type CoreError } from "./core.js";
 import { createErrorHandler } from "./errors.js";
 import { createRateLimiter } from "./limits.js";
 import { proxy } from "./proxy.js";
 import { addNoncePlaceholders, fillNonce, newNonce, originPolicy, pageCsp, securityHeaders } from "./security.js";
-import { initStore, store } from "./store.js";
+import { INTENT_TTL_MS, initStore, store } from "./store.js";
 import { isId, parseIntentInput } from "./validate.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
@@ -41,12 +43,15 @@ const MAX_FIELD = 512;
 
 assertConfigSane();
 initStore();
-// A hosted deployment must not carry the demo's wildcard redirect.
-if (CONFIG.production) assertNoWildcardRedirects(store.allMerchants());
+// A wildcard redirect is for the local demo only. Check it whenever this service
+// is reachable from elsewhere, not just when NODE_ENV says "production": a
+// hosted box running with NODE_ENV=development must not carry one either.
+if (CONFIG.production || !originIsLoopback()) assertNoWildcardRedirects(store.allMerchants());
 // Drop abandoned checkouts and expired payer names now and every minute, so
-// neither depends on a restart.
+// neither depends on a restart. The timer reports a failed write instead of
+// letting it escape and end the process.
 store.sweep();
-setInterval(() => store.sweep(), 60_000).unref();
+setInterval(() => store.sweepSafely(), 60_000).unref();
 // Seed a demo merchant only where explicitly asked for and the core is on
 // loopback, so the flow is exercisable without a real partner.
 if (devShortcutsEnabled()) seedDemoMerchant(process.env.CHECKOUT_DEMO_IBAN);
@@ -88,10 +93,43 @@ const bearer = (req: express.Request) => {
 
 const isShortString = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= MAX_FIELD;
 
+/**
+ * Answer a failed call to the core. The core's own refusals (4xx) are relayed so
+ * the page can say why. Anything else is OUR problem to describe: a 3xx or 5xx, an
+ * unreadable reply, a timeout or an unreachable core becomes a fixed message with
+ * the right gateway status, never raw upstream text.
+ */
 function relayCoreError(err: unknown, res: express.Response) {
+  if (err instanceof CoreResponseError) {
+    console.error(`checkout: ${err.message}`);
+    return res.status(502).json({ error: "the Zold API sent an unexpected response" });
+  }
   const e = err as CoreError;
-  if (typeof e?.status === "number") return res.status(e.status).json({ error: e.message });
-  res.status(502).json({ error: "could not reach the Zold API" });
+  if (typeof e?.status === "number") {
+    if (e.status >= 400 && e.status < 500) return res.status(e.status).json({ error: e.message });
+    return res.status(502).json({ error: "the Zold API could not complete the request" });
+  }
+  const timedOut = (err as Error)?.name === "TimeoutError" || (err as Error)?.name === "AbortError";
+  res.status(timedOut ? 504 : 502).json({
+    error: timedOut ? "the Zold API did not respond in time" : "could not reach the Zold API",
+  });
+}
+
+/**
+ * The payer's legal name is optional evidence for the merchant. It must never be
+ * the reason a payment that has already left the payer's account cannot be
+ * attached, so a failed lookup means no name, not no checkout.
+ */
+async function lookupPayerName(userId: string, token: string, intentId: string): Promise<string | undefined> {
+  try {
+    // Read with the CALLER's session, so we can only ever learn the name of
+    // the person actually completing this checkout.
+    const payer = await core<{ name?: string }>(`/api/users/${encodeURIComponent(userId)}`, { sessionToken: token });
+    return typeof payer?.name === "string" ? payer.name : undefined;
+  } catch {
+    console.warn(`checkout: payer name unavailable for checkout ${intentId}`);
+    return undefined;
+  }
 }
 
 /** What the browser needs to know about how this deployment is configured. */
@@ -148,7 +186,7 @@ app.post(
         amountEur: intent.amountEur,
         destinationIban: intent.destinationIban,
         reference: intent.reference,
-        expiresAt: new Date(Date.parse(intent.createdAt) + 15 * 60_000).toISOString(),
+        expiresAt: new Date(Date.parse(intent.createdAt) + INTENT_TTL_MS).toISOString(),
       });
     } catch (e) {
       if (e instanceof CheckoutError) return res.status(400).json({ error: e.message });
@@ -180,7 +218,7 @@ app.get(
       return res.status(400).json({ error: "redirect_uri not allowed for this client" });
     }
     try {
-      const intent = createIntent(merchant, parsed.value);
+      const intent = createIntent(merchant, { ...parsed.value, channel: "front" });
       // Absolute: the merchant redirects the user here from its own origin.
       const checkoutUrl = `${CONFIG.publicOrigin}/checkout?intent=${intent.id}`;
       if ((req.header("accept") ?? "").includes("application/json")) {
@@ -210,6 +248,9 @@ app.get(
       // page shows it to the user and folds it into the signed destination
       // commitment, so it must be the one pinned at creation.
       merchantIban: intent.destinationIban,
+      // What the payer's transfer must carry as its payment reference. Unique to
+      // this checkout, so the payment can only ever be matched back to it.
+      transferReference: transferReference(intent),
       expired: isIntentExpired(intent),
     });
   }),
@@ -230,23 +271,25 @@ app.post(
     const transferId = req.body?.transferId;
     // It becomes a path segment on the core API, so it must be a plain id.
     if (!isId(transferId)) return res.status(400).json({ error: "transferId required" });
-    let transfer: CoreTransfer;
-    let payerName: string | undefined;
+    let transfer;
     try {
-      transfer = await core<CoreTransfer>(`/api/transfers/${encodeURIComponent(transferId)}`, { sessionToken: token });
-      // Read with the CALLER's session, so we can only ever learn the name of
-      // the person actually completing this checkout.
-      const payer = await core<{ name?: string }>(`/api/users/${encodeURIComponent(transfer.userId)}`, {
-        sessionToken: token,
-      });
-      payerName = typeof payer?.name === "string" ? payer.name : undefined;
+      // Read with the CALLER's session: a transfer another user owns is not
+      // readable with it, so the core's 403/404 is the ownership check.
+      transfer = parseCoreTransfer(
+        await core(`/api/transfers/${encodeURIComponent(transferId)}`, { sessionToken: token }),
+        transferId,
+      );
     } catch (err) {
       return relayCoreError(err, res);
     }
+    const payerName = await lookupPayerName(transfer.userId, token, intent.id);
     try {
-      res.json(attachTransfer(intent, transfer.userId, transfer, payerName));
+      // By id, not the record fetched above: it can be stale after the awaits.
+      res.json(attachTransfer(intent.id, transfer, payerName));
     } catch (e) {
-      if (e instanceof CheckoutError) return res.status(400).json({ error: e.message });
+      if (e instanceof CheckoutError) {
+        return res.status(e.status).json({ error: e.message, ...(e.retryable ? { retryable: true } : {}) });
+      }
       throw e;
     }
   }),

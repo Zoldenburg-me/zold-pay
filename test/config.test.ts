@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 process.env.CHECKOUT_SUBJECT_SECRET = "test-subject-secret";
-const { assertConfigSane, CONFIG } = await import("../server/src/config.js");
+const { assertConfigSane, CONFIG, devShortcutsEnabled, originIsLoopback } = await import("../server/src/config.js");
 
 const prod = () => ({
   ...CONFIG,
@@ -52,6 +52,39 @@ describe("assertConfigSane", () => {
   it("outside production, still refuses dev shortcuts against a non-loopback core", () => {
     const cfg = { ...CONFIG, production: false, subjectSecret: "x", allowDevShortcuts: true, coreApiUrl: "https://core.example" };
     assert.throws(() => assertConfigSane(cfg), /loopback/);
+  });
+
+  // The demo merchant has a published secret and accepts any redirect URI, so it
+  // must only exist where nobody else can reach it: loopback core AND loopback origin.
+  describe("the demo merchant", () => {
+    const dev = (over: Record<string, unknown>) => ({
+      ...CONFIG, production: false, environment: "development" as const, subjectSecret: "x", allowDevShortcuts: true,
+      coreApiUrl: "http://127.0.0.1:3000", publicOrigin: "http://localhost:3100", ...over,
+    });
+
+    it("is allowed on a fully local run", () => {
+      assert.doesNotThrow(() => assertConfigSane(dev({})));
+      assert.equal(devShortcutsEnabled(dev({})), true);
+    });
+
+    it("is refused on a hosted origin even with NODE_ENV=development and a loopback core", () => {
+      const hosted = dev({ publicOrigin: "https://pay.example.com" });
+      assert.throws(() => assertConfigSane(hosted), /ALLOW_DEV_SHORTCUTS.*CHECKOUT_PUBLIC_ORIGIN/s);
+      assert.equal(devShortcutsEnabled(hosted), false, "never seeded, whatever the startup check says");
+    });
+
+    it("is not seeded unless asked for", () => {
+      assert.equal(devShortcutsEnabled(dev({ allowDevShortcuts: false })), false);
+    });
+
+    it("recognises loopback origins in every spelling", () => {
+      for (const origin of ["http://localhost:3100", "http://127.0.0.1:3100", "http://[::1]:3100"]) {
+        assert.equal(originIsLoopback({ ...CONFIG, publicOrigin: origin }), true, origin);
+      }
+      for (const origin of ["https://pay.example.com", "https://localhost.evil.test", "not a url"]) {
+        assert.equal(originIsLoopback({ ...CONFIG, publicOrigin: origin }), false, origin);
+      }
+    });
   });
 
   it("refuses a hosted-looking origin when NODE_ENV is neither production nor development", () => {

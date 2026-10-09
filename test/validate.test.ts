@@ -42,7 +42,8 @@ describe("parseIntentInput", () => {
   });
 
   it("caps reference and state lengths", () => {
-    bad({ reference: "r".repeat(141) }, /reference/);
+    // 120, not 140: the checkout appends its own unique reference to the SEPA remittance line.
+    bad({ reference: "r".repeat(121) }, /reference/);
     bad({ reference: 42 }, /reference/);
     bad({ state: "s".repeat(513) }, /state/);
   });

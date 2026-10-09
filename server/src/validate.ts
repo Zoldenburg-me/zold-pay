@@ -22,7 +22,9 @@ export interface ParseOptions {
   allowInsecureLoopback: boolean;
 }
 
-const MAX_REFERENCE = 140; // the SEPA remittance field
+// The SEPA remittance field is 140 characters. The checkout appends its own unique
+// reference ("ZP" + 12 hex, plus a space) to the merchant's, so the merchant's part gets 120.
+const MAX_REFERENCE = 120;
 const MAX_STATE = 512;
 const MAX_REDIRECT_URI = 2048;
 const MAX_IBAN_INPUT = 64;
