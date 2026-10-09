@@ -63,7 +63,27 @@ export interface Merchant {
   createdAt: string;
 }
 
-export type IntentStatus = "PENDING" | "AUTHORIZED" | "PAID" | "FAILED" | "EXPIRED";
+/**
+ * PAYING: one payer has claimed the checkout and may be moving money for it right
+ * now. Claimed before any core transfer exists, so a second tab or device cannot
+ * start a second payment (see claimIntent).
+ */
+export type IntentStatus = "PENDING" | "PAYING" | "AUTHORIZED" | "PAID" | "FAILED" | "EXPIRED";
+
+/**
+ * Why a settled payment for a checkout could not be attached to it: the checkout
+ * was already paid, someone else held the claim, or it had closed before the
+ * payment arrived.
+ */
+export type UnattachedReason = "duplicate" | "claimed_by_another" | "late";
+
+export interface UnattachedPayment {
+  transferId: string;
+  reason: UnattachedReason;
+  /** The transfer's state when it was recorded. PAYOUT_SUBMITTED can still fail later. */
+  state: string;
+  recordedAt: string;
+}
 
 export interface PaymentIntent {
   id: string;
@@ -106,6 +126,19 @@ export interface PaymentIntent {
   codeExpiresAt?: string;
   /** SHA-256 of the bearer the merchant polls status with. */
   statusTokenHash?: string;
+  /** The payer holding the claim while the checkout is PAYING. */
+  claimUserId?: string;
+  /** SHA-256 of the claim token held by the paying tab; the token itself is never stored. */
+  claimTokenHash?: string;
+  claimedAt?: string;
+  /**
+   * Settled payments made for this checkout that could not be attached to it.
+   * The money has left the payer and SEPA cannot be recalled by us, so they are
+   * kept for the merchant to see and refund, never dropped.
+   */
+  unattachedPayments?: UnattachedPayment[];
+  /** More arrived than are kept (the list is capped); an operator has the log line. */
+  unattachedPaymentsTruncated?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -240,6 +273,12 @@ function commit(next: Db): void {
 /** Abandoned checkouts are dropped after this; settled ones are kept for the merchant to poll. */
 const DEAD_INTENT_MAX_AGE_MS = 60 * 60_000;
 const DEAD_STATUSES: ReadonlySet<IntentStatus> = new Set(["PENDING", "EXPIRED", "FAILED"]);
+/**
+ * A claimed checkout may have a payment in flight that has not been attached yet.
+ * Dropping it after an hour would lose the attach target and any duplicate record,
+ * so it is kept for a day.
+ */
+const CLAIMED_INTENT_MAX_AGE_MS = 24 * 60 * 60_000;
 
 export const store = {
   allMerchants: () => [...db.merchants],
@@ -257,7 +296,7 @@ export const store = {
     return db.paymentIntents.find((i) => i.transferId === transferId);
   },
   /**
-   * Checkouts a merchant can still be paid through, on one channel. Ones past
+   * Checkouts a merchant can still be paid through (open or being paid), on one channel. Ones past
    * their time limit are not counted even though they stay PENDING until swept:
    * otherwise anyone holding the public client id could fill the cap with checkouts
    * that can no longer be paid and lock the merchant out for an hour.
@@ -266,7 +305,7 @@ export const store = {
     db.paymentIntents.filter(
       (i) =>
         i.merchantId === merchantId &&
-        i.status === "PENDING" &&
+        (i.status === "PENDING" || i.status === "PAYING") &&
         (i.channel ?? "back") === channel &&
         now - Date.parse(i.createdAt) <= INTENT_TTL_MS,
     ).length,
@@ -276,9 +315,14 @@ export const store = {
    * codes that expired without being exchanged.
    */
   sweep(now: number = Date.now()) {
-    const kept = db.paymentIntents.filter(
-      (i) => !(DEAD_STATUSES.has(i.status) && now - Date.parse(i.createdAt) > DEAD_INTENT_MAX_AGE_MS),
-    );
+    const kept = db.paymentIntents.filter((i) => {
+      // A recorded payment is money the merchant must refund: never swept.
+      if (i.unattachedPayments?.length) return true;
+      // Written as "older than" so a date that cannot be read (NaN) keeps the record.
+      const olderThan = (ms: number) => now - Date.parse(i.createdAt) > ms;
+      if (i.status === "PAYING") return !olderThan(CLAIMED_INTENT_MAX_AGE_MS);
+      return !(DEAD_STATUSES.has(i.status) && olderThan(DEAD_INTENT_MAX_AGE_MS));
+    });
     const purged = purgeStalePayerNames(kept, now);
     if (kept.length !== db.paymentIntents.length || purged.changed) {
       commit({ ...db, paymentIntents: purged.intents });
