@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pay with Zold — hosted merchant checkout with inline new-user onboarding",
+  "description": "Pay with Zold — hosted merchant checkout for existing Zold users",
   "engines": { "node": ">=22" },
   "scripts": {
     "dev": "tsx watch server/src/server.ts",

@@ -60,6 +60,23 @@ key survives a reload:
   unrecoverable after a reload. That is a blocker for the wrap, not a bug in
   this page.
 
+## Losing the confirmation after paying
+
+The server-side retry and the page's recovery logic are covered by tests with
+stubs; this checks it for real, once.
+
+1. Start a checkout and pay it, but stop the checkout service (or block
+   `/api/checkout/intents/*/attach` in the browser's network panel) right after
+   the last passkey prompt, before the page can confirm with the merchant.
+2. The page must say *"Your payment was sent. Do not pay again"*, and the button
+   must read **Confirm with merchant**. It must not show the pay form.
+3. Reload the tab. The same screen must come back (the transfer is remembered for
+   the tab's session).
+4. Restore the service and press the button. It must go through to the merchant
+   **without** another quote, transfer or passkey prompt, and the merchant's
+   first code must no longer work.
+5. Open the same checkout link in a second tab: it must say "Already paid".
+
 ## Things that should refuse
 
 - **Identity check not approved.** Sign in with an account whose check is pending:
