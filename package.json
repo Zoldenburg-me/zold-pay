@@ -9,7 +9,9 @@
     "dev": "tsx watch server/src/server.ts",
     "start": "tsx server/src/server.ts",
     "typecheck": "tsc --noEmit",
-    "onboard:test": "tsx scripts/onboard-test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "harness:smoke": "tsx scripts/harness-smoke.ts"
   },
   "dependencies": {
     "express": "^4.21.2"

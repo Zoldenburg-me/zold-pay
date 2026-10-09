@@ -20,21 +20,24 @@ interface Rule {
   pattern: string;
 }
 
-/** Exactly what the checkout page needs, and nothing else. */
+/**
+ * Exactly what the checkout page needs for an EXISTING Zold user, and nothing
+ * else. Creating an account (signup, passkey registration, Safe deployment,
+ * Monerium identity) happens in the main app, which the checkout links new
+ * users to; none of those routes are reachable through here.
+ */
 const ALLOW: Rule[] = [
   { method: "GET", pattern: "/api/health" },
 
-  // Account creation and read-back.
-  { method: "POST", pattern: "/api/users" },
+  // Read back the signed-in user (balances, KYC state).
   { method: "GET", pattern: "/api/users/:id" },
   { method: "GET", pattern: "/api/users/:id/kyc" },
 
-  // WebAuthn: register, sign in, step up.
+  // WebAuthn: sign in, and step up for sensitive actions.
   { method: "POST", pattern: "/api/webauthn/challenge" },
-  { method: "POST", pattern: "/api/users/:id/passkey" },
   { method: "POST", pattern: "/api/passkey/login" },
 
-  // FP4 device key binding.
+  // Device key binding, for an existing account that has not bound one yet.
   { method: "POST", pattern: "/api/users/:id/authorizer" },
 
   // Quote, create, device-sign, submit.
@@ -51,29 +54,45 @@ const ALLOW: Rule[] = [
  *                               authorization server. Nothing to forward.
  *   /api/kyc/review             operator token; approving KYC is not a
  *                               checkout capability.
- *   /api/users/:id/kyc/mock-review, /api/simulate/*
- *                               self-approval and minted balance. Reachable
- *                               only via this service's /bff/dev/* routes,
- *                               which are loopback- and opt-in-gated.
- *   /api/users/:id/monerium/*   account linking belongs in the consumer app.
+ *   POST /api/users, /api/users/:id/passkey, /api/users/:id/passkey-safe/*
+ *                               signup, passkey registration, Safe
+ *                               deployment: the main app's job.
+ *   /api/users/:id/monerium/*   identity and account linking: the main app.
+ *   /api/simulate/*, /kyc/mock-review
+ *                               no longer exist in the core; never proxy
+ *                               self-approval or minted balance.
  *   /api/webhooks/*             rail callbacks, not user traffic.
  */
+
+/**
+ * An id segment is a plain token. This is what stops `..`, `%2e%2e`, `%2F` and
+ * friends: `fetch` normalises dot segments, so letting one through would turn
+ * `/api/users/..` into a request for `/api/` on the core, around this list.
+ */
+const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 function matches(rule: Rule, method: string, path: string): boolean {
   if (rule.method !== method) return false;
   const want = rule.pattern.split("/");
   const got = path.split("/");
   if (want.length !== got.length) return false;
-  return want.every((seg, i) => (seg === ":id" ? got[i].length > 0 && got[i] !== ":id" : seg === got[i]));
+  return want.every((seg, i) => (seg === ":id" ? ID_RE.test(got[i] ?? "") : seg === got[i]));
 }
 
 export function isAllowed(method: string, path: string): boolean {
+  // No percent-encoding in any allowed path: core ids never need it, and a
+  // decoded slash or dot is exactly how an allowlist gets walked around.
+  if (path.includes("%") || path.includes("//")) return false;
   return ALLOW.some((r) => matches(r, method, path));
 }
 
-/** First hop's client address, for the core's per-IP rate limits. */
+/**
+ * The client address as Express resolved it, honouring only the hops we were
+ * told to trust. The inbound X-Forwarded-For is never forwarded: a client could
+ * otherwise write the chain the core rate-limits on.
+ */
 function clientIp(req: express.Request): string {
-  return (req.socket.remoteAddress ?? "").replace(/^::ffff:/, "");
+  return (req.ip ?? req.socket.remoteAddress ?? "").replace(/^::ffff:/, "");
 }
 
 export const proxy: express.Handler = async (req, res) => {
@@ -87,19 +106,18 @@ export const proxy: express.Handler = async (req, res) => {
   if (auth) headers.authorization = auth;
   const hasBody = req.method === "POST";
   if (hasBody) headers["content-type"] = "application/json";
-  if (CONFIG.forwardClientIp) {
-    // Append rather than replace: if something already sits in front of us the
-    // core needs the whole chain to count hops correctly.
-    const existing = req.header("x-forwarded-for");
-    headers["x-forwarded-for"] = existing ? `${existing}, ${clientIp(req)}` : clientIp(req);
-  }
+  if (CONFIG.forwardClientIp) headers["x-forwarded-for"] = clientIp(req);
 
-  const url = CONFIG.coreApiUrl + path + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
+  // No allowed route takes a query string, so none is forwarded.
+  const url = CONFIG.coreApiUrl + path;
 
   try {
     const upstream = await fetch(url, {
       method: req.method,
       headers,
+      // The core's answer is passed through as-is; a redirect is never chased
+      // to a place the allowlist did not name.
+      redirect: "manual",
       body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
       signal: AbortSignal.timeout(CONFIG.coreTimeoutMs),
     });
