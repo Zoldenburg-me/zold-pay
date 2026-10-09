@@ -1,14 +1,32 @@
 # Pay with Zold — checkout service
 
-> **Status, September 2026.** The consumer-facing "pay by link" product now
-> lives in the core repo as **payment requests** (`/pay/<handle>/<code>`, plus
-> a Shopify payments app on the same requests) — see the core CLAUDE.md
-> section "Payment links + Shopify". This service is the merchant OAuth/PKCE
-> handoff and was written against a July 2026 core API; the core has since
-> replaced RemitVault with user-signed execution and made Monerium the identity
-> provider, so the flow below needs re-verifying before it is pointed at a
-> current core. It has not been retired: a partner that needs a code exchange
-> (the Mony shape) is still what this half is for.
+> **Status, October 2026.** The consumer-facing "pay by link" product lives in
+> the core repo as **payment requests** (`/pay/<handle>/<code>`, plus a Shopify
+> payments app on the same requests). This service is the merchant OAuth/PKCE
+> handoff, for a partner that needs a code exchange (the Mony shape).
+>
+> It has been brought up to date with core `main` (537a2d6) for **existing Zold
+> users only**: the checkout signs the user in with their passkey, signs the
+> terms with the device key, collects the two passkey assertions the core now
+> requires on `authorize` (`safeExecution` and `moneriumRedeem`), and attaches
+> the transfer. Creating an account, the identity check and Safe deployment
+> happen in the Zold app (`ZOLD_APP_URL`); none of those routes are proxied.
+> Credentials are stored hashed, and the service refuses to start in production
+> without an https origin, an explicit `TRUSTED_PROXY_HOPS`, and a strong secret.
+>
+> **Verified:** the offline suite (`npm run check`) and the wiring against a
+> running local core (`npm run harness:smoke`). **Not verified:** the WebAuthn
+> ceremonies and a real SEPA payment (see BROWSER-CHECKLIST.md).
+>
+> **Stale below:** the sections on the new-user flow, the dev shortcuts, and "What
+> is real, and what is not" still describe the earlier design and are being
+> revised. Where they disagree with this note, this note and the code win.
+>
+> **Known limits:** a merchant's status stays `AUTHORIZED` after the payout
+> completes, because this service holds no credential to re-read the transfer
+> from the core (needs a service credential or a webhook from the core), and
+> merchants can only be added by editing the store; there is no registration
+> endpoint yet.
 
 Repo: `tonyzil/pay-with-zold`, alongside `tonyzil/transF`. The directory on disk
 is `zold-checkout`, and the main repo's CLAUDE.md calls this "the
@@ -380,23 +398,24 @@ None of this affects ADR 0001 stage 2 (passkey as a Safe owner). That is about
 ## Tests
 
 ```bash
-npm run onboard:test
+npm run check          # typecheck + the whole offline suite
+npm run harness:smoke  # against a running local core (see the script header)
 ```
 
-Drives the whole new-user flow headlessly — account, KYC, device key, funding,
-the device-signed SEPA payment, attach, and the merchant's PKCE exchange
-(rejecting a wrong verifier, a wrong client secret, and a replayed code) — plus
-the proxy allowlist. It runs against its own `data/checkout-test.json`, and
-needs the core API running; it deliberately does not spawn or reset the core,
-because that store is a single `db.json` at its repo root and a test in another
-repo has no business wiping it.
+`npm run check` needs nothing else running. It covers: hashed credentials and
+the store migration, constant-time comparison, input validation, rate limiting,
+security headers and the origin policy, the production fail-closed config, the
+proxy allowlist (including path tricks), the transfer checks, the merchant flow
+over real HTTP against a stub core (intent, attach, code exchange, status,
+replay), `device.js`, and source checks that pin the checkout page's wiring.
 
-The two WebAuthn ceremonies cannot run headlessly. They are covered by
-[BROWSER-CHECKLIST.md](BROWSER-CHECKLIST.md), by hand, in a real browser.
+`npm run harness:smoke` runs against a live core started with the core's
+`npm run dev`. It stops at the core's own refusal for SEPA, because a payment
+needs a live Monerium connection that a local harness cannot provide.
 
-```bash
-npm run typecheck
-```
+The WebAuthn ceremonies and the SEPA payment itself cannot run headlessly. They
+are covered by [BROWSER-CHECKLIST.md](BROWSER-CHECKLIST.md), by hand, in a real
+browser, and are **not yet verified** on this branch.
 
 ---
 
