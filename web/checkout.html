@@ -129,10 +129,84 @@ const TRANSFER_KEY = `zold-checkout-transfer:${intentId}`;
 const rememberTransfer = (id) => sessionStorage.setItem(TRANSFER_KEY, id);
 const rememberedTransfer = () => sessionStorage.getItem(TRANSFER_KEY);
 const forgetTransfer = () => sessionStorage.removeItem(TRANSFER_KEY);
+/* The claim on this checkout, held by the one tab allowed to pay it. Taken before
+   any transfer exists, so a second tab or device that loaded the same checkout is
+   refused instead of paying it a second time. Kept across a reload of this tab. */
+const CLAIM_KEY = `zold-checkout-claim:${intentId}`;
+const holdClaim = (token) => sessionStorage.setItem(CLAIM_KEY, token);
+const heldClaim = () => sessionStorage.getItem(CLAIM_KEY);
+const forgetClaim = () => sessionStorage.removeItem(CLAIM_KEY);
+
+/* sessionStorage is copied when a tab is duplicated, claim token included. A Web
+   Lock is not: only one live tab of this browser can hold it, so a copy cannot
+   resume the claim while the original tab is still open. Held until let go or the
+   page goes away. */
+const LOCK_HELD = "held", LOCK_BUSY = "busy", LOCK_UNAVAILABLE = "unavailable";
+let releaseClaimLock = null;
+let claimLockRequest = null;
+/* One request at a time: two overlapping asks (the page loading, a click) would
+   otherwise make this tab refuse itself. Resolves to LOCK_HELD, LOCK_BUSY or
+   LOCK_UNAVAILABLE. */
+function takeClaimLock() {
+  if (releaseClaimLock) return Promise.resolve(LOCK_HELD);
+  if (!claimLockRequest) claimLockRequest = requestClaimLock().finally(() => { claimLockRequest = null; });
+  return claimLockRequest;
+}
+function requestClaimLock() {
+  // Without Web Locks (an old browser, or a frame that refuses them) two tabs cannot
+  // be told apart, so the page refuses to pay rather than guess.
+  if (!navigator.locks) return Promise.resolve(LOCK_UNAVAILABLE);
+  return new Promise((resolve) => {
+    let asked;
+    try {
+      asked = navigator.locks.request(CLAIM_KEY, { ifAvailable: true }, (lock) => {
+        if (!lock) return resolve(LOCK_BUSY);
+        resolve(LOCK_HELD);
+        return new Promise((release) => { releaseClaimLock = release; });
+      });
+    } catch {
+      return resolve(LOCK_UNAVAILABLE);
+    }
+    Promise.resolve(asked).catch(() => resolve(LOCK_UNAVAILABLE));
+  });
+}
+function dropClaimLock() {
+  if (releaseClaimLock) releaseClaimLock();
+  releaseClaimLock = null;
+}
+/* 32 random bytes. Made by the page and kept BEFORE the claim is sent, so a claim
+   whose answer is lost is asked for (or released) again with the same token. */
+const newClaimToken = () => b64url(crypto.getRandomValues(new Uint8Array(32)));
+const IN_PROGRESS = "This checkout is already being paid in another window or device. Finish it there.";
+const UNSAFE_BROWSER =
+  "This browser can't make sure the checkout is paid only once. Pay from an up-to-date browser, outside a private or embedded window.";
+
+/* Core answers to the authorization that mean it did not happen. Anything else (a
+   conflict, a timeout, a gateway error, no answer) may have moved the money. */
+const AUTHORIZE_REFUSED = new Set([400, 401, 403, 404, 429]);
 const ATTACH_ATTEMPTS = 8;      // a payout that is still settling is waited for,
 const ATTACH_WAIT_MS = 2500;    // roughly 20 seconds in all
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const DO_NOT_PAY_AGAIN = "Your payment was sent. Do not pay again";
+
+/* A refusal from our API, with the server's stable code. A request that got no
+   answer at all is a plain TypeError from fetch, never one of these. */
+class ApiError extends Error {
+  constructor(message, status, code, retryable) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    // The server marks a refusal that asking again can fix (a payout still settling).
+    this.retryable = retryable;
+  }
+}
+/* The authorization of `transferId` got no clear answer: the money may have moved. */
+class PaymentMaybeSentError extends Error {
+  constructor(transferId, cause) {
+    super(cause.message);
+    this.transferId = transferId;
+  }
+}
 
 async function request(path, body) {
   const headers = {};
@@ -142,13 +216,7 @@ async function request(path, body) {
   const text = await res.text();
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text.slice(0, 300) }; }
-  if (!res.ok) {
-    const err = new Error(data.error || res.statusText);
-    err.status = res.status;
-    // The server marks a refusal that asking again can fix (a payout still settling).
-    err.retryable = data.retryable === true;
-    throw err;
-  }
+  if (!res.ok) throw new ApiError(data.error || res.statusText, res.status, data.code, data.retryable === true);
   return data;
 }
 const api = (p, b) => request(p, b);
@@ -211,20 +279,55 @@ async function load() {
   if (intent.status === "AUTHORIZED" || intent.status === "PAID") {
     return result(true, "Already paid", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`);
   }
-  if (intent.status !== "PENDING") return result(false, "This checkout can't be paid", "Ask the merchant to start again.");
+  // Claimed by a tab: if it is not this one, another window or device is paying.
+  if (intent.status === "PAYING" && !(heldClaim() && (await takeClaimLock()) === LOCK_HELD)) {
+    return result(false, "Payment in progress",
+      "This checkout is being paid in another window or device. Finish it there, or ask the merchant to start again.");
+  }
+  if (intent.status !== "PENDING" && intent.status !== "PAYING") {
+    return result(false, "This checkout can't be paid", "Ask the merchant to start again.");
+  }
   if (intent.expired) return result(false, "Checkout expired", "Ask the merchant to start again.");
   $("head").classList.remove("hidden");
   show("pay");
 }
 
-/* Look again, right before any money can move: the checkout may have been paid in
-   another tab, or run out, since this page loaded. */
-async function assertStillOpen() {
-  const fresh = await api(`/api/checkout/intents/${encodeURIComponent(intentId)}`);
-  if (fresh.status !== "PENDING" || fresh.expired) {
-    throw new Error("This checkout is no longer open. Ask the merchant to start again.");
+/* Claim the checkout for this payer, right before any money can move. The server
+   gives it to one tab only, so a checkout opened in two tabs or on two devices is
+   paid once: the other is refused here, before it creates a transfer. */
+async function claimCheckout() {
+  const lock = await takeClaimLock();
+  if (lock === LOCK_BUSY) throw new Error(IN_PROGRESS);
+  if (lock === LOCK_UNAVAILABLE) throw new Error(UNSAFE_BROWSER);
+  const claimToken = heldClaim() || newClaimToken();
+  holdClaim(claimToken);
+  try {
+    await api(`/api/checkout/intents/${encodeURIComponent(intentId)}/claim`, { userId: user.id, claimToken });
+  } catch (e) {
+    // A plain refusal: this tab holds nothing, so it keeps nothing. Anything else
+    // (no answer, a server error) may have left the claim with this tab; the token
+    // is kept so the caller can release it, or a retry can resume it.
+    const refused = ["payment_in_progress", "checkout_closed", "checkout_expired"];
+    if (e instanceof ApiError && refused.includes(e.code)) {
+      forgetClaim();
+      dropClaimLock();
+      if (e.code === "payment_in_progress") throw new Error(IN_PROGRESS);
+      throw new Error("This checkout is no longer open. Ask the merchant to start again.");
+    }
+    throw e;
   }
-  intent = fresh;
+}
+
+/* Give the checkout back after a payment that surely did not happen, so the payer
+   can try again. If that fails the claim stays with this tab, which can resume it. */
+async function releaseHeldClaim() {
+  const claimToken = heldClaim();
+  if (!claimToken) return;
+  try {
+    await api(`/api/checkout/intents/${encodeURIComponent(intentId)}/release`, { claimToken });
+    forgetClaim();
+    dropClaimLock();
+  } catch { /* kept: this tab can still resume its claim */ }
 }
 
 /* ---------- WebAuthn ---------- */
@@ -355,12 +458,19 @@ async function authorizePayment(quote) {
   const execution = await dev.passkeyAssertion(created.authorization.safeExecution);
   const redeem = await dev.passkeyAssertion(created.authorization.moneriumRedeem);
 
-  // 4. Authorize.
-  await api(`/api/transfers/${created.id}/authorize`, {
-    signature,
-    ...(execution ? { executionAssertion: execution } : {}),
-    ...(redeem ? { moneriumRedeemAssertion: redeem } : {}),
-  });
+  // 4. Authorize. Only a plain refusal (AUTHORIZE_REFUSED) means it did not happen.
+  //    Anything else may have moved the money, so the caller must treat this
+  //    transfer as paid until the merchant says otherwise.
+  try {
+    await api(`/api/transfers/${created.id}/authorize`, {
+      signature,
+      ...(execution ? { executionAssertion: execution } : {}),
+      ...(redeem ? { moneriumRedeemAssertion: redeem } : {}),
+    });
+  } catch (e) {
+    if (e instanceof ApiError && AUTHORIZE_REFUSED.has(e.status)) throw e;
+    throw new PaymentMaybeSentError(created.id, e);
+  }
   return created.id;
 }
 
@@ -385,8 +495,18 @@ async function confirmAndFinish(transferId) {
     redirectUrl = await confirmWithMerchant(transferId);
   } catch (e) {
     // The merchant already has this payment: nothing left to do.
-    if (e.message === "checkout already completed") {
+    // Recorded on the checkout for the merchant to refund: nothing for this tab to
+    // confirm, ever. Say so plainly instead of offering "Confirm" forever.
+    if (e.code === "duplicate_payment" || e.code === "late_payment") {
       forgetTransfer();
+      forgetClaim();
+      dropClaimLock();
+      return result(false, "Payment recorded", e.message.charAt(0).toUpperCase() + e.message.slice(1) + ".");
+    }
+    if (e.code === "checkout_completed") {
+      forgetTransfer();
+      forgetClaim();
+      dropClaimLock();
       return result(true, "Already paid", `${fmt(intent.amountEur)} to ${intent.merchant || "the merchant"}.`);
     }
     throw e;
@@ -400,6 +520,8 @@ function finish(redirectUrl) {
   sessionStorage.removeItem("zold-checkout-session");
   sessionToken = null;
   forgetTransfer();
+  forgetClaim();
+  dropClaimLock();
   let target = null;
   try { target = new URL(redirectUrl, location.origin); } catch { /* handled below */ }
   const local = target && ["localhost", "127.0.0.1", "[::1]"].includes(target.hostname);
@@ -428,7 +550,7 @@ $("btn-pay").onclick = async () => {
     user = { ...user, ...me };
     assertReady(user);
     busy(btn, "Preparing…");
-    await assertStillOpen();
+    await claimCheckout();
     await ensureDeviceKey();
     const { quote, fee } = await quoteForMerchant();
     $("fee").textContent = fmt(fee);
@@ -445,6 +567,10 @@ $("btn-pay").onclick = async () => {
     busy(btn, "Confirming with the merchant…");
     await confirmAndFinish(transferId);
   } catch (e) {
+    // No clear answer to the authorization: the money may have moved. From here this
+    // tab only ever confirms that transfer, and keeps the claim so nobody pays again.
+    if (e instanceof PaymentMaybeSentError) rememberTransfer(e.transferId);
+    if (!rememberedTransfer()) await releaseHeldClaim();
     if (rememberedTransfer()) {
       // Paid, but the merchant has not been told. Say so, and make the next click
       // a confirmation, never another payment.
