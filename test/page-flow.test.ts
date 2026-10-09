@@ -494,3 +494,82 @@ describe("a payment the checkout could not take", () => {
     });
   }
 });
+
+describe("the spending key", () => {
+  it("is minted only passkey-protected: the page asks device.js for strict mode", async () => {
+    let asked: unknown;
+    const happy = happyRoute();
+    const { authorizerAddress: _bound, ...unbound } = USER;
+    const page = boot({
+      // An account with no spending key yet: the page mints one and binds it.
+      route: (m, p, b, c) =>
+        p === "/api/users/u1" || p === "/api/passkey/login" ? [200, unbound]
+        : p === "/api/users/u1/authorizer" ? [200, { authorizerAddress: "0xabc" }]
+        : happy(m, p, b, c),
+      device: {
+        keyStatus: () => ({ present: false, protection: null }),
+        createKey: async (_cred: string, opts: unknown) => ((asked = opts), { address: "0xabc", protection: "prf" }),
+      },
+    });
+    await settle();
+    await click(page);
+    assert.equal(count(page, "/api/users/u1/authorizer"), 1, "a key was minted and bound");
+    // Read the field: the options object comes from the page's own realm.
+    assert.equal((asked as { requirePrf?: unknown } | undefined)?.requirePrf, true);
+  });
+
+  it("refuses to pay with a key this browser holds unencrypted, before any money can move", async () => {
+    const page = boot({ route: happyRoute(), device: { keyStatus: () => ({ present: true, protection: "none" }) } });
+    await settle();
+    await click(page);
+    assert.equal(count(page, "/api/quotes"), 0);
+    assert.equal(count(page, "/api/transfers"), 0);
+    assert.match(page.el("err").textContent, /unencrypted.*Zold app/);
+    assert.equal(count(page, RELEASE), 1, "the claim is given back: nothing was paid");
+  });
+});
+
+describe("asking device.js for the address", () => {
+  it("always in strict mode, so a key cleared by another tab mid-flow is never re-made unencrypted", async () => {
+    const modes: unknown[] = [];
+    const page = boot({
+      route: happyRoute(),
+      device: { deviceAddress: async (_cred: string, opts: { requirePrf?: unknown } | undefined) => (modes.push(opts?.requirePrf), "0xABC") },
+    });
+    await settle();
+    await click(page);
+    assert.ok(modes.length > 0, "the page asked for the address");
+    assert.ok(modes.every((m) => m === true), `every call strict: ${modes.join(",")}`);
+  });
+});
+
+describe("the spending key, checked again", () => {
+  it("refuses a damaged key record before any money can move", async () => {
+    const page = boot({ route: happyRoute(), device: { keyStatus: () => ({ present: true, protection: null, damaged: true }) } });
+    await settle();
+    await click(page);
+    assert.equal(count(page, "/api/transfers"), 0);
+    assert.match(page.el("err").textContent, /damaged.*Zold app/);
+  });
+
+  it("re-checks the key's protection right before signing", async () => {
+    let created = false;
+    let signed = false;
+    const happy = happyRoute();
+    const page = boot({
+      route: (m, p, b, c) => {
+        if (p === "/api/transfers") created = true;
+        return happy(m, p, b, c);
+      },
+      device: {
+        // Swapped for an unencrypted key after the first checks (another tab, say).
+        keyStatus: () => ({ present: true, protection: created ? "none" : "prf" }),
+        signTypedData: async () => ((signed = true), "0xsig"),
+      },
+    });
+    await settle();
+    await click(page);
+    assert.equal(signed, false);
+    assert.match(page.el("err").textContent, /unencrypted/);
+  });
+});
