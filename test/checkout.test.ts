@@ -195,6 +195,14 @@ describe("attachTransfer retries and timing", () => {
     assert.equal(store.findPaymentIntent(intent.id)!.status, "PAID");
   });
 
+  it("never lowers a checkout settled to PAID when a retried attach carries the older PAYOUT_SUBMITTED", () => {
+    const { intent } = setup();
+    attach(intent.id); // PAYOUT_SUBMITTED: AUTHORIZED
+    store.updatePaymentIntent(intent.id, { status: "PAID" }); // settled meanwhile (settle.ts)
+    attach(intent.id); // the payer's retry, with the state it read before settlement
+    assert.equal(store.findPaymentIntent(intent.id)!.status, "PAID");
+  });
+
   it("refuses a retry once the merchant has exchanged the code", () => {
     const { intent } = setup();
     co.exchangeCode("shop", "s3cret", codeOf(attach(intent.id).redirectUrl), VERIFIER);
