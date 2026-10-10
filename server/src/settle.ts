@@ -53,6 +53,10 @@ const FINAL = new Map<string, "PAID" | "FAILED">([
   ["REFUNDED", "FAILED"],
 ]);
 
+/** What a Zold state looks like. Anything else is Zold's text, not ours to put in a log line. */
+const STATE_SHAPE = /^[A-Z][A-Z_]{0,31}$/;
+const loggable = (state: string): string => (STATE_SHAPE.test(state) ? state : "an unrecognised state");
+
 /** `…3000` as Zold writes it, with or without the ellipsis. */
 const LAST_FOUR = /^…?([A-Za-z0-9]{4})$/;
 
@@ -194,7 +198,7 @@ export function createSettlePoller(opts: SettlePollerOptions) {
 
   const noteState = (id: string, transferId: string, state: string) => {
     const before = lastState.get(id);
-    lastState.set(id, state);
+    lastState.set(id, loggable(state));
     if (state === "MANUAL_REVIEW" && before !== state) {
       log(`SETTLE_REVIEW checkout ${id}: transfer ${transferId} is in manual review at Zold`);
     }
@@ -250,7 +254,7 @@ export function createSettlePoller(opts: SettlePollerOptions) {
       } catch (err) {
         // Zold has answered; only our write failed. Not Zold's fault, so no
         // backoff: it is due again on the next tick.
-        log(`SETTLE_STORE_WRITE_FAILED checkout ${id}: Zold says ${transfer.state}, not saved: ${(err as Error)?.message ?? String(err)}`);
+        log(`SETTLE_STORE_WRITE_FAILED checkout ${id}: Zold says ${loggable(transfer.state)}, not saved: ${(err as Error)?.message ?? String(err)}`);
         backoff.delete(id);
         continue;
       }
