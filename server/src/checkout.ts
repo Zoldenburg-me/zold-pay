@@ -164,7 +164,7 @@ export function transferReference(intent: { reference: string; payRef: string })
 }
 
 /** Whole cents, so amounts are compared exactly instead of within a float tolerance. */
-const toCents = (eur: unknown): number =>
+export const toCents = (eur: unknown): number =>
   typeof eur === "number" && Number.isFinite(eur) ? Math.round(eur * 100) : Number.NaN;
 
 /** Milliseconds since `iso`; a date that cannot be read counts as infinitely old, never as fresh. */
@@ -323,8 +323,8 @@ export function releaseClaim(intentId: string, claimToken: string): void {
  * Payout states of a SEPA transfer that count as a completed checkout. (The
  * core's PAYOUT_READY / PAYOUT_FUNDED belong to the cash rail only.)
  * PAYOUT_SUBMITTED is not final: it can still end FAILED, REFUNDED or in manual
- * review, and nothing here refreshes the merchant's status from the core after the
- * attach (see README "Known gaps"), so AUTHORIZED is not proof of final payment.
+ * review, so it attaches as AUTHORIZED, and settle.ts moves it to PAID or FAILED
+ * once Zold says the payout is final. AUTHORIZED is not proof of final payment.
  */
 const SETTLED = new Set(["PAYOUT_SUBMITTED", "PAID"]);
 
@@ -480,7 +480,9 @@ export function attachTransfer(intentId: string, transfer: CoreTransfer, payerNa
   }
 
   const code = newToken();
-  const status: PaymentIntent["status"] = transfer.state === "PAID" ? "PAID" : "AUTHORIZED";
+  // A retried attach can carry a state read before settlement moved this checkout
+  // to PAID (settle.ts); PAID is final, so it is never lowered.
+  const status: PaymentIntent["status"] = intent.status === "PAID" || transfer.state === "PAID" ? "PAID" : "AUTHORIZED";
   store.updatePaymentIntent(intent.id, {
     status,
     userId: transfer.userId,

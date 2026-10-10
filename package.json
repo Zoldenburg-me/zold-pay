@@ -9,8 +9,8 @@
     "dev": "tsx watch server/src/server.ts",
     "start": "tsx server/src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
-    "coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-include=\"server/src/**\" --test-coverage-lines=80 --test-coverage-branches=80 --test-coverage-functions=80 test/*.test.ts",
+    "test": "node --import tsx --test --test-timeout=60000 test/*.test.ts",
+    "coverage": "node --import tsx --test --test-timeout=60000 --experimental-test-coverage --test-coverage-include=\"server/src/**\" --test-coverage-lines=80 --test-coverage-branches=80 --test-coverage-functions=80 test/*.test.ts",
     "check": "npm run typecheck && npm run coverage",
     "gate": "npm run check && npm audit --audit-level=low",
     "harness:smoke": "tsx scripts/harness-smoke.ts"
