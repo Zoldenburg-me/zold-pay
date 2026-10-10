@@ -22,9 +22,8 @@
 > is real, and what is not" still describe the earlier design and are being
 > revised. Where they disagree with this note, this note and the code win.
 >
-> **Known limits:** a merchant's status stays `AUTHORIZED` after the payout
-> completes, because this service holds no credential to re-read the transfer
-> from the core (needs a service credential or a webhook from the core), and
+> **Known limits:** a merchant's status moves from `AUTHORIZED` to `PAID` or
+> `FAILED` only when `ZOLD_SERVICE_TOKEN` is set (see *Settlement*), and
 > merchants can only be added by editing the store; there is no registration
 > endpoint yet.
 
@@ -301,7 +300,11 @@ secret returns:
 }
 ```
 
-- **`status`** can also be `PAYING` while a payer is part-way through.
+- **`status`** can also be `PAYING` while a payer is part-way through, and
+  `AUTHORIZED` when the payment is attached but its SEPA payout is not final.
+  **`AUTHORIZED` is not final payment**: poll the status until it is `PAID`
+  (the money reached you) or `FAILED` (the payout failed or was refunded to the
+  payer; do not deliver). A checkout that is `PAID` stays `PAID`.
 - **`unattachedPayments`** (only present when non-empty) lists settled payments
   made for this checkout that could not be attached to it, each with
   `transferId`, `amountEur`, `reason` (`duplicate`: it was already paid;
@@ -322,6 +325,49 @@ secret returns:
   first-party. Real PII crossing to a third party: it needs a lawful basis and
   a merchant agreement, and it is deliberately absent from the unauthenticated
   `GET /api/checkout/intents/:id` the checkout page reads.
+
+### Settlement
+
+A SEPA payout is often still `PAYOUT_SUBMITTED` when the payer finishes, so the
+checkout attaches it as `AUTHORIZED` and settles it later, without the payer:
+
+- **Polling.** Every `SETTLE_POLL_SECONDS` (60) this service reads each
+  `AUTHORIZED` checkout's transfer from Zold's
+  `GET /api/service/checkout/transfers/:id` with `ZOLD_SERVICE_TOKEN`, a `zsc_`
+  credential a Zold operator issues (`POST /api/admin/service-credentials/checkout/rotate`).
+  A payout still moving waits 30 s before its next read, then twice as long
+  each time up to an hour, and is read on the first tick after that; at most 50
+  reads a tick. A 401, 503 or 429 from Zold ends the tick. Zold's `PAID` makes the checkout `PAID`; `FAILED` or
+  `REFUNDED` makes it `FAILED`; anything else (`MANUAL_REVIEW` included) leaves
+  it `AUTHORIZED`.
+- **Checked again.** The reference, amount, rail and the account's last four
+  characters must still match the checkout, or nothing changes and the mismatch
+  is logged.
+- **Webhook (optional).** With `ZOLD_WEBHOOK_SECRET` (the `whsec_` secret Zold's
+  `CHECKOUT_WEBHOOK_SECRET` holds), Zold's signed `{transferId}` at
+  `POST /bff/zold/webhook` triggers that read at once. It is never believed about
+  a state, only told which transfer to read, so a replay costs one read. Set
+  Zold's `CHECKOUT_WEBHOOK_URL` to `https://<checkout origin>/bff/zold/webhook`.
+- **A 401, 503 or 429 from Zold, or Zold unreachable or timing out**, stops the
+  tick; the next tick tries again. A tick asked for while one runs (a webhook
+  during a slow tick) makes the running one go round again, so it is not lost.
+- **What to alert on.** Every problem is logged under a token: `SETTLE_STALLED`
+  (no read can work; on the first stopped tick and every tenth, with the time it
+  began) and `SETTLE_RECOVERED`; `SETTLE_STUCK` (a checkout `AUTHORIZED` for
+  over a day, with Zold's last state, once a day); `SETTLE_REVIEW` (Zold put the
+  payout in manual review); `SETTLE_MISMATCH` (Zold's answer does not match the
+  checkout, once per checkout); `SETTLE_STORE_WRITE_FAILED` (Zold said final and
+  we could not save it; retried next tick). Refused webhooks are counted once a
+  minute, split into bad signature (is the secret Zold's?) and outside the time
+  window (clock drift?).
+- **Rotation.** Zold keeps the previous credential working for 24 h after a
+  rotation: set the new token and restart inside that window.
+
+Without `ZOLD_SERVICE_TOKEN` an `AUTHORIZED` checkout stays `AUTHORIZED`. In
+production that refuses to start unless `SETTLE_DISABLED=1` says it is on
+purpose; elsewhere it logs a warning. A `PAID` or `FAILED` checkout stays
+readable by its merchant for 90 days, then is swept; an `AUTHORIZED` one is
+never swept.
 
 ### The reference on the bank statement
 
@@ -463,14 +509,11 @@ have them.
 
 ## Known gaps in this service
 
-**Intent status is captured at attach and does not advance.** The core version
-re-read the transfer from its own store on every status poll, so a payout that
-reached `PAID` later showed up. This service cannot: reading a transfer needs
-the user's session, and the merchant polls long after the user has gone. On the
-local chain the transfer is already `PAID` at attach so it never shows; on a
-real SEPA payout an intent would sit at `AUTHORIZED` forever. The fix is
-core-side — a checkout webhook, or a service credential that can read a transfer
-without a user session.
+**Settlement needs Zold's service credential.** Without `ZOLD_SERVICE_TOKEN` an
+`AUTHORIZED` checkout never advances (see *Settlement*). The backoff lives in
+memory, so a restart reads every `AUTHORIZED` checkout once, straight away. Recorded
+`unattachedPayments` keep the state they were recorded with; they are not
+re-read.
 
 **No merchant onboarding.** Merchants are added by editing `data/checkout.json`
 (secrets are stored as hashes, not plaintext).
@@ -558,6 +601,14 @@ finishes up to 10 minutes after the checkout's 15-minute window is still accepte
   pay in the Zold app. Worth a line to merchants.
 - **`/bff/health` returns only `{ ok, core: { reachable } }`** and the core's
   `/api/health` is no longer proxied.
+- **Checkouts settle.** Set `ZOLD_SERVICE_TOKEN` (and optionally
+  `ZOLD_WEBHOOK_SECRET`) and an `AUTHORIZED` checkout moves to `PAID` or
+  `FAILED`. Tell merchants that `FAILED` can now follow `AUTHORIZED`. A checkout
+  with a payment attached is kept while `AUTHORIZED` and for 90 days once `PAID`
+  or `FAILED` (it used to be kept for ever once paid). **Production now refuses
+  to start without `ZOLD_SERVICE_TOKEN`**; set `SETTLE_DISABLED=1` to run
+  without settlement. The token is refused over plain http to a non-loopback
+  `CORE_API_URL`, in every environment.
 - **`npm run check` no longer runs `npm audit`**; `npm run gate` does. Node 22.8
   or later is required (the coverage gate).
 
@@ -568,8 +619,6 @@ finishes up to 10 minutes after the checkout's 15-minute window is still accepte
 
 - `RP_ID=zold.app` and both origins in `WEBAUTHN_ORIGINS`.
 - `TRUSTED_PROXY_HOPS` set to the real hop count.
-- A way for this service to observe a transfer reaching its terminal state
-  (see *Known gaps*).
 - A per-account device-key slot in `device.js` (see above).
 - Tiered KYC, if a low-friction first payment is wanted.
 
@@ -583,6 +632,8 @@ server/src/core.ts      typed client for the core API (this service's own calls)
 server/src/store.ts     merchants + payment intents (JSON file)
 server/src/checkout.ts  the authorization-server logic, ported from the core
 server/src/proxy.ts     the allowlist
+server/src/settle.ts    AUTHORIZED → PAID / FAILED, read with Zold's service credential
+server/src/zold-webhook.ts  Zold's signed "read this transfer now" hint
 server/src/server.ts    checkout routes, /bff/* routes, proxy mount, static page
 web/checkout.html       the checkout + onboarding page
 web/device.js           copy of the main repo's services/api/public/device.js — see below

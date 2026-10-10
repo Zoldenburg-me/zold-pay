@@ -31,14 +31,16 @@ import {
   statusView,
   transferReference,
 } from "./checkout.js";
-import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled, originIsLoopback } from "./config.js";
+import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled, originIsLoopback, settlementWarning } from "./config.js";
 import { core, type CoreError } from "./core.js";
 import { createErrorHandler } from "./errors.js";
 import { createRateLimiter } from "./limits.js";
 import { proxy } from "./proxy.js";
 import { addNoncePlaceholders, fillNonce, newNonce, originPolicy, pageCsp, securityHeaders } from "./security.js";
 import { INTENT_TTL_MS, initStore, store } from "./store.js";
+import { createSettlePoller, zoldTransferReader } from "./settle.js";
 import { isId, parseIntentInput } from "./validate.js";
+import { createZoldWebhookRouter } from "./zold-webhook.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
 const MAX_FIELD = 512;
@@ -54,6 +56,38 @@ if (CONFIG.production || !originIsLoopback()) assertNoWildcardRedirects(store.al
 // letting it escape and end the process.
 store.sweep();
 setInterval(() => store.sweepSafely(), 60_000).unref();
+// Move AUTHORIZED checkouts to PAID or FAILED once Zold says the payout is final.
+// Every 30 s to start, doubling to an hour per checkout while a payout is still
+// moving; at most 50 reads a tick, inside Zold's per-credential rate limit.
+const SETTLE_BATCH = 50;
+const SETTLE_MAX_DELAY_MS = 60 * 60_000;
+/** How soon after a webhook the extra tick runs; deliveries inside it share one tick. */
+const SETTLE_NUDGE_DELAY_MS = 1_000;
+const settler = CONFIG.zoldServiceToken
+  ? createSettlePoller({
+      read: zoldTransferReader(),
+      baseDelayMs: Math.min(30_000, CONFIG.settlePollMs),
+      maxDelayMs: SETTLE_MAX_DELAY_MS,
+      batch: SETTLE_BATCH,
+    })
+  : undefined;
+const settleTick = () => void settler?.tick().catch((e) => console.error("checkout settle: tick failed", e));
+let nudgeTimer: NodeJS.Timeout | undefined;
+const settleSoon = (transferId: string) => {
+  if (!settler?.nudge(transferId) || nudgeTimer) return;
+  nudgeTimer = setTimeout(() => {
+    nudgeTimer = undefined;
+    settleTick();
+  }, SETTLE_NUDGE_DELAY_MS);
+  nudgeTimer.unref();
+};
+if (settler) {
+  // Once now, so a restart does not leave checkouts a whole interval behind.
+  settleTick();
+  setInterval(settleTick, CONFIG.settlePollMs).unref();
+} else {
+  console.warn(`checkout: ${settlementWarning()}`);
+}
 // Seed a demo merchant only where explicitly asked for and the core is on
 // loopback, so the flow is exercisable without a real partner.
 if (devShortcutsEnabled()) seedDemoMerchant(process.env.CHECKOUT_DEMO_IBAN);
@@ -95,6 +129,11 @@ const frontChannelMerchantLimit = createRateLimiter({
     return isShortString(clientId) && store.findMerchantByClientId(clientId) ? clientId : undefined;
   },
 });
+
+// Zold's state-change hint. Before the JSON parser: its signature is over the raw body.
+if (settler && CONFIG.zoldWebhookSecret) {
+  app.use(createZoldWebhookRouter({ secret: CONFIG.zoldWebhookSecret, onTransfer: settleSoon }));
+}
 
 app.use(express.json({ limit: CONFIG.jsonBodyLimit }));
 

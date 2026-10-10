@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 process.env.CHECKOUT_SUBJECT_SECRET = "test-subject-secret";
-const { assertConfigSane, CONFIG, devShortcutsEnabled, originIsLoopback } = await import("../server/src/config.js");
+const { assertConfigSane, CONFIG, devShortcutsEnabled, originIsLoopback, settlementWarning } = await import("../server/src/config.js");
 
 const prod = () => ({
   ...CONFIG,
@@ -19,6 +19,7 @@ const prod = () => ({
   trustedProxyHops: 1,
   allowDevShortcuts: false,
   subjectSecret: "x".repeat(32),
+  zoldServiceToken: `zsc_${"A".repeat(43)}`,
 });
 
 describe("assertConfigSane", () => {
@@ -126,5 +127,71 @@ describe("assertConfigSane", () => {
       assert.match(r.stderr, new RegExp(name), `${name}=${value}`);
       assert.equal(r.stderr.includes(`"${value}"`), false, `${name}: the error names the setting, never its value`);
     }
+  });
+});
+
+describe("settlement settings", () => {
+  const TOKEN = `zsc_${"A".repeat(43)}`;
+  const WHSEC = `whsec_${Buffer.alloc(24, 7).toString("base64")}`;
+
+  it("accepts a Zold service token alone (the checkout polls) and with a webhook secret", () => {
+    assert.doesNotThrow(() => assertConfigSane({ ...prod(), zoldServiceToken: TOKEN }));
+    assert.doesNotThrow(() => assertConfigSane({ ...prod(), zoldServiceToken: TOKEN, zoldWebhookSecret: WHSEC }));
+  });
+
+  it("refuses a malformed service token and never echoes it", () => {
+    for (const bad of ["zsc_short", `zsk_${"A".repeat(43)}`, `zsc_${"A".repeat(42)}!`, `${TOKEN} `]) {
+      assert.throws(
+        () => assertConfigSane({ ...prod(), zoldServiceToken: bad }),
+        (e: Error) => /ZOLD_SERVICE_TOKEN/.test(e.message) && !e.message.includes(bad.trim()),
+      );
+    }
+  });
+
+  it("refuses a webhook secret that is malformed or under 24 bytes, and never echoes it", () => {
+    const short = `whsec_${Buffer.alloc(23, 7).toString("base64")}`;
+    for (const bad of ["whsec_", "secret", short, "whsec_!!!!"]) {
+      assert.throws(
+        () => assertConfigSane({ ...prod(), zoldServiceToken: TOKEN, zoldWebhookSecret: bad }),
+        (e: Error) => /ZOLD_WEBHOOK_SECRET/.test(e.message) && !e.message.includes(bad.slice(6) || "\0"),
+      );
+    }
+  });
+
+  it("refuses a webhook secret without a service token: the webhook only says which transfer to read", () => {
+    assert.throws(() => assertConfigSane({ ...prod(), zoldServiceToken: "", zoldWebhookSecret: WHSEC }), /ZOLD_WEBHOOK_SECRET is set but ZOLD_SERVICE_TOKEN/);
+  });
+
+  it("refuses to send the service token to a plain-http core that is not loopback, in production or not", () => {
+    for (const cfg of [prod(), { ...CONFIG, production: false, environment: "development" as const }]) {
+      assert.throws(
+        () => assertConfigSane({ ...cfg, coreApiUrl: "http://core.internal.zold.app", zoldServiceToken: TOKEN }),
+        /CORE_API_URL/,
+      );
+    }
+    assert.doesNotThrow(() => assertConfigSane({ ...prod(), coreApiUrl: "http://127.0.0.1:3000", zoldServiceToken: TOKEN }));
+  });
+
+  it("in production, refuses to start without the token unless settlement is switched off on purpose", () => {
+    assert.throws(() => assertConfigSane({ ...prod(), zoldServiceToken: "" }), /ZOLD_SERVICE_TOKEN.*SETTLE_DISABLED/s);
+    assert.doesNotThrow(() => assertConfigSane({ ...prod(), zoldServiceToken: "", settleDisabled: true }));
+  });
+
+  it("warns, without refusing, when nothing will ever settle an AUTHORIZED checkout", () => {
+    assert.match(String(settlementWarning({ ...prod(), zoldServiceToken: "" })), /ZOLD_SERVICE_TOKEN/);
+    assert.equal(settlementWarning({ ...prod(), zoldServiceToken: TOKEN }), undefined);
+  });
+
+  it("reads the poll interval in seconds and refuses a malformed one", () => {
+    const entry = pathToFileURL(path.join(ROOT, "server/src/config.ts")).href;
+    // Under 10 s, a fraction, or past an hour (setInterval overflows near 24.8 days and then fires every ms).
+    for (const value of ["0", "9", "1.5", "3601", "2200000", "abc"]) {
+      const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `await import(${JSON.stringify(entry)})`], {
+        cwd: ROOT, encoding: "utf8", timeout: 20_000, env: { ...process.env, SETTLE_POLL_SECONDS: value },
+      });
+      assert.notEqual(r.status, 0, value);
+      assert.match(r.stderr, /SETTLE_POLL_SECONDS/, value);
+    }
+    assert.equal(CONFIG.settlePollMs, 60_000);
   });
 });

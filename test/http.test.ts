@@ -170,3 +170,10 @@ describe("rate limiting", () => {
     assert.ok(Number(limited.headers.get("retry-after")) >= 1);
   });
 });
+
+describe("Zold webhook mount", () => {
+  it("is not mounted without ZOLD_WEBHOOK_SECRET", async () => {
+    const r = await call("/bff/zold/webhook", { method: "POST", json: { transferId: "t1" } });
+    assert.equal(r.status, 404);
+  });
+});

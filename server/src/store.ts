@@ -280,6 +280,9 @@ const DEAD_STATUSES: ReadonlySet<IntentStatus> = new Set(["PENDING", "EXPIRED", 
  */
 const CLAIMED_INTENT_MAX_AGE_MS = 24 * 60 * 60_000;
 
+/** How long a PAID or FAILED checkout stays readable by its merchant. */
+export const SETTLED_INTENT_MAX_AGE_MS = 90 * 24 * 60 * 60_000;
+
 export const store = {
   allMerchants: () => [...db.merchants],
   findMerchant: (id: string) => db.merchants.find((m) => m.id === id),
@@ -320,6 +323,10 @@ export const store = {
       if (i.unattachedPayments?.length) return true;
       // Written as "older than" so a date that cannot be read (NaN) keeps the record.
       const olderThan = (ms: number) => now - Date.parse(i.createdAt) > ms;
+      // A checkout that had a payment attached is the merchant's record of it,
+      // including one whose payout later FAILED: kept while it can still change,
+      // and for SETTLED_INTENT_MAX_AGE_MS once it cannot.
+      if (i.transferId) return i.status === "AUTHORIZED" || !olderThan(SETTLED_INTENT_MAX_AGE_MS);
       if (i.status === "PAYING") return !olderThan(CLAIMED_INTENT_MAX_AGE_MS);
       return !(DEAD_STATUSES.has(i.status) && olderThan(DEAD_INTENT_MAX_AGE_MS));
     });
@@ -341,6 +348,8 @@ export const store = {
       return false;
     }
   },
+  /** Checkouts with a payment attached whose payout is not final yet (see settle.ts). */
+  intentsAwaitingSettlement: () => db.paymentIntents.filter((i) => i.status === "AUTHORIZED" && !!i.transferId),
   findPaymentIntentByCode(code: string) {
     // An empty/undefined code must never match an intent whose code was burned.
     if (!code) return undefined;
