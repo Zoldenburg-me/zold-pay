@@ -48,6 +48,21 @@ const proxyHops = (v: string | undefined): number | undefined => {
   return n;
 };
 
+/**
+ * Whole seconds, 10 to 3600. A fraction or a value past setInterval's 24.8-day
+ * limit would make the poll fire every millisecond.
+ */
+const MIN_SETTLE_SECONDS = 10;
+const MAX_SETTLE_SECONDS = 3600;
+const settleSeconds = (v: string | undefined): number => {
+  if (v === undefined || v === "") return 60;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < MIN_SETTLE_SECONDS || n > MAX_SETTLE_SECONDS) {
+    throw new Error(`SETTLE_POLL_SECONDS must be a whole number from ${MIN_SETTLE_SECONDS} to ${MAX_SETTLE_SECONDS}`);
+  }
+  return n;
+};
+
 const environment = (): "production" | "development" | "unset" => {
   const e = process.env.NODE_ENV;
   if (e === "production") return "production";
@@ -78,6 +93,18 @@ export interface Config {
   /** Largest checkout amount accepted, in EUR. */
   maxAmountEur: number;
   rateLimit: { windowMs: number; general: number; credential: number; client: number };
+  /**
+   * Bearer credential for Zold's checkout-service read (GET
+   * /api/service/checkout/transfers/:id), issued and rotated by a Zold operator.
+   * Empty: AUTHORIZED checkouts are never settled to PAID or FAILED.
+   */
+  zoldServiceToken: string;
+  /** Standard Webhooks secret (`whsec_...`) for Zold's state-change hint. Empty: no webhook, polling only. */
+  zoldWebhookSecret: string;
+  /** How often AUTHORIZED checkouts are checked for a final payout state. */
+  settlePollMs: number;
+  /** SETTLE_DISABLED=1: run in production without ZOLD_SERVICE_TOKEN, knowing nothing settles. */
+  settleDisabled: boolean;
 }
 
 const publicOrigin = (process.env.CHECKOUT_PUBLIC_ORIGIN ?? "http://localhost:3100").replace(/\/+$/, "");
@@ -144,6 +171,11 @@ export const CONFIG: Config = {
     // Per merchant, across every address: front-channel checkouts started per window.
     client: num("RATE_LIMIT_CLIENT", process.env.RATE_LIMIT_CLIENT, 60),
   },
+
+  zoldServiceToken: (process.env.ZOLD_SERVICE_TOKEN ?? "").trim(),
+  zoldWebhookSecret: (process.env.ZOLD_WEBHOOK_SECRET ?? "").trim(),
+  settlePollMs: settleSeconds(process.env.SETTLE_POLL_SECONDS) * 1000,
+  settleDisabled: bool(process.env.SETTLE_DISABLED, false),
 };
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -178,6 +210,38 @@ export function devShortcutsEnabled(cfg: Config = CONFIG): boolean {
 
 const MIN_PRODUCTION_SECRET_LENGTH = 32;
 
+/** What Zold issues: `zsc_` and 32 random bytes in base64url. */
+const SERVICE_TOKEN = /^zsc_[A-Za-z0-9_-]{43}$/;
+/** Standard Webhooks: `whsec_` and a base64 key, which Zold requires to be at least 24 bytes. */
+const WEBHOOK_SECRET = /^whsec_[A-Za-z0-9+/]+={0,2}$/;
+const MIN_WEBHOOK_KEY_BYTES = 24;
+
+/** Settlement settings. Errors name the setting, never its value. */
+function assertSettlementSane(cfg: Config): void {
+  if (cfg.zoldServiceToken && !SERVICE_TOKEN.test(cfg.zoldServiceToken)) {
+    throw new Error("ZOLD_SERVICE_TOKEN is not a Zold checkout-service token (zsc_ and 43 base64url characters).");
+  }
+  if (!cfg.zoldWebhookSecret) return;
+  if (!cfg.zoldServiceToken) {
+    throw new Error(
+      "ZOLD_WEBHOOK_SECRET is set but ZOLD_SERVICE_TOKEN is not. The webhook only names a transfer to read, " +
+        "and reading it needs the service token.",
+    );
+  }
+  if (
+    !WEBHOOK_SECRET.test(cfg.zoldWebhookSecret) ||
+    Buffer.from(cfg.zoldWebhookSecret.slice("whsec_".length), "base64").length < MIN_WEBHOOK_KEY_BYTES
+  ) {
+    throw new Error(`ZOLD_WEBHOOK_SECRET must be whsec_ and a base64 key of at least ${MIN_WEBHOOK_KEY_BYTES} bytes.`);
+  }
+}
+
+/** Said at startup when nothing will move an AUTHORIZED checkout on; not a refusal, since it was the old behaviour. */
+export function settlementWarning(cfg: Config = CONFIG): string | undefined {
+  if (cfg.zoldServiceToken) return undefined;
+  return "ZOLD_SERVICE_TOKEN is not set: AUTHORIZED checkouts will never move to PAID or FAILED.";
+}
+
 /** Refuse to start on a configuration that would be unsafe or silently wrong. */
 export function assertConfigSane(cfg: Config = CONFIG): void {
   if (!cfg.subjectSecret) {
@@ -200,6 +264,11 @@ export function assertConfigSane(cfg: Config = CONFIG): void {
         "reachable from anywhere but this machine; refusing to start.",
     );
   }
+  assertSettlementSane(cfg);
+  // Whatever NODE_ENV says: a staging box would send the token in the clear too.
+  if (cfg.zoldServiceToken && !coreIsLoopback(cfg) && !cfg.coreApiUrl.startsWith("https://")) {
+    throw new Error("CORE_API_URL must be https (or loopback) when ZOLD_SERVICE_TOKEN is set: it carries the token.");
+  }
   if (!/^https?:\/\//.test(cfg.appUrl) || !URL.canParse(cfg.appUrl)) {
     throw new Error(`ZOLD_APP_URL must be an http(s) URL, got "${cfg.appUrl}".`);
   }
@@ -221,6 +290,12 @@ export function assertConfigSane(cfg: Config = CONFIG): void {
   }
   if (!cfg.production) return;
 
+  if (!cfg.zoldServiceToken && !cfg.settleDisabled) {
+    throw new Error(
+      "ZOLD_SERVICE_TOKEN is not set: AUTHORIZED checkouts would never move to PAID or FAILED, and merchants " +
+        "would wait on them for ever. Set it, or SETTLE_DISABLED=1 to run without settlement on purpose.",
+    );
+  }
   if (cfg.allowDevShortcuts) {
     throw new Error("ALLOW_DEV_SHORTCUTS must not be set in production: it seeds a wildcard-redirect demo merchant.");
   }
