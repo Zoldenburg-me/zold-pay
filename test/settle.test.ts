@@ -369,6 +369,17 @@ describe("settle poller", () => {
     assert.equal(logged.filter((l) => l.startsWith("SETTLE_STUCK")).length, 2);
   });
 
+  it("never writes Zold's own text into a log line: an odd state is named as unrecognised", async () => {
+    const created = Date.parse(authorized("t1").createdAt);
+    const a = store.findPaymentIntentByTransfer("t1")!;
+    const logged: string[] = [];
+    const p = poller(async () => view(a, { state: "PAID\nFAKE log line" }), { log: (m) => logged.push(String(m)) });
+    await p.tick(created + 25 * 3600 * SEC); // read, then...
+    await p.tick(created + 50 * 3600 * SEC); // ...a stuck report naming the last state
+    assert.equal(logged.some((l) => l.includes("\n") || l.includes("FAKE")), false);
+    assert.match(logged.join("|"), /an unrecognised state/);
+  });
+
   it("reports manual review at Zold once, not on every read", async () => {
     const a = authorized("t1");
     const logged: string[] = [];
