@@ -29,6 +29,7 @@ const { createShopifyAdmin } = await import("../server/src/shopify-admin.js");
 const { createMerchantCore } = await import("../server/src/core-merchant.js");
 const { createErrorHandler } = await import("../server/src/errors.js");
 const { signBody, signQuery } = await import("../server/src/shopify-hmac.js");
+const { INSTALL_COOKIE } = await import("../server/src/shopify-install.js");
 
 const SECRET = "app-secret";
 const SHOP = "keycard-demo.myshopify.com";
@@ -44,10 +45,9 @@ const ctx = {
   manualGateway: "zold",
   publicOrigin: ORIGIN,
   corePublicUrl: CORE_PUBLIC,
-  allowInsecureLoopback: true,
   tokenKey: randomBytes(32),
   admin: createShopifyAdmin({ apiKey: "app-key", apiSecret: SECRET, scopes: "read_orders,write_orders", apiVersion: "2026-07", shopBaseUrl: stub.base }),
-  core: createMerchantCore({ token: SERVICE_TOKEN, allowInsecureLoopback: true }),
+  core: createMerchantCore({ token: SERVICE_TOKEN, corePublicUrl: CORE_PUBLIC }),
   log: (...a: unknown[]) => {
     const line = a.map(String).join(" ");
     logs.push(line);
@@ -88,7 +88,7 @@ const call = async (p: string, init: RequestInit = {}) => {
   return { status: res.status, body, location: res.headers.get("location") ?? "", headers: res.headers };
 };
 
-const webhook = (topic: string, payload: unknown, opts: { shop?: string; secret?: string; id?: string } = {}) => {
+const webhook = (topic: string, payload: unknown, opts: { shop?: string; secret?: string; id?: string; headers?: Record<string, string> } = {}) => {
   const raw = JSON.stringify(payload);
   return call("/shopify/webhooks", {
     method: "POST",
@@ -98,6 +98,7 @@ const webhook = (topic: string, payload: unknown, opts: { shop?: string; secret?
       "x-shopify-shop-domain": opts.shop ?? SHOP,
       "x-shopify-topic": topic,
       "x-shopify-webhook-id": opts.id ?? randomUUID(),
+      ...(opts.headers ?? {}),
     },
     body: raw,
   });
@@ -108,18 +109,41 @@ const oauthQuery = (state: string, shop: string, code = "good-code") => {
   return new URLSearchParams({ ...q, hmac: signQuery(q, SECRET) }).toString();
 };
 
-/** The install route's redirect to Shopify, and the state nonce it carries. */
+/** The install route's redirect to Shopify, the state nonce it carries, and the browser-binding cookie. */
 const startInstall = async (shop: string, link: string) => {
   const r = await call(`/shopify/install?${new URLSearchParams({ shop, link })}`);
   assert.equal(r.status, 302, JSON.stringify(r.body));
-  return new URL(r.location);
+  const setCookie = r.headers.get("set-cookie") ?? "";
+  const m = new RegExp(`${INSTALL_COOKIE}=([^;]+)`).exec(setCookie);
+  assert.ok(m, `no install cookie: ${setCookie}`);
+  return { url: new URL(r.location), state: new URL(r.location).searchParams.get("state")!, cookie: m[1], setCookie };
+};
+const cookieHeader = (value: string) => ({ cookie: `other=1; ${INSTALL_COOKIE}=${value}` });
+
+const callback = (state: string, shop: string, cookie: string | undefined, code = "good-code") =>
+  call(`/shopify/callback?${oauthQuery(state, shop, code)}`, { headers: cookie === undefined ? {} : cookieHeader(cookie) });
+
+const pendingOf = (page: { body: { text?: string } }) => {
+  const m = /name="pending" value="([^"]+)"/.exec(page.body.text ?? "");
+  assert.ok(m, `no confirmation page: ${page.body.text}`);
+  return m[1];
 };
 
+const confirmInstall = (pending: string, cookie: string | undefined, action = "link") =>
+  call("/shopify/confirm", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", ...(cookie === undefined ? {} : cookieHeader(cookie)) },
+    body: new URLSearchParams({ pending, action }).toString(),
+  });
+
+/** The whole connect: install, Shopify's callback, the confirmation page, "Link this store". */
 const connect = async (shop: string, linkId?: string) => {
-  const link = stub.mintLinkCode(shop, linkId);
-  const auth = await startInstall(shop, link);
-  return call(`/shopify/callback?${oauthQuery(auth.searchParams.get("state")!, shop)}`);
+  const started = await startInstall(shop, stub.mintLinkCode(shop, linkId));
+  const page = await callback(started.state, shop, started.cookie);
+  assert.equal(page.status, 200, page.location);
+  return confirmInstall(pendingOf(page), started.cookie);
 };
+const exchangeCalls = () => stub.coreCalls.filter((x) => x.path === "/api/service/merchant/links/exchange").length;
 
 let orderNo = 3100;
 const order = (over: Record<string, unknown> = {}) => {
@@ -143,17 +167,18 @@ beforeEach(() => {
 });
 
 describe("install", () => {
-  it("sends the merchant to Shopify's authorize page with our scopes, callback and a fresh state", async () => {
-    const u = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+  it("sends the merchant to Shopify's authorize page with our scopes, callback and a fresh state, bound by an HttpOnly cookie", async () => {
+    const { url: u, setCookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
     assert.equal(u.origin + u.pathname, `${stub.base}/${SHOP}/admin/oauth/authorize`);
     assert.equal(u.searchParams.get("scope"), "read_orders,write_orders");
     assert.equal(u.searchParams.get("client_id"), "app-key");
     assert.equal(u.searchParams.get("redirect_uri"), `${ORIGIN}/shopify/callback`);
     assert.match(u.searchParams.get("state")!, /^[A-Za-z0-9_-]{32}$/);
     assert.equal(u.searchParams.has("link"), false, "the link code went to Shopify");
+    for (const attr of [/HttpOnly/i, /Secure/i, /SameSite=Lax/i, /Path=\//i]) assert.match(setCookie, attr);
   });
 
-  it("never echoes the link code: not in a refusal, not in the redirect to Shopify, not in a log line", async () => {
+  it("never echoes the link code: not in a refusal, the redirect to Shopify, the cookie or a log line", async () => {
     const code = stub.mintLinkCode(SHOP);
     const refused = await call(`/shopify/install?${new URLSearchParams({ shop: "evil.example.com", link: code })}`);
     const refusedShape = await call(`/shopify/install?${new URLSearchParams({ shop: SHOP, link: `${code}x` })}`);
@@ -161,11 +186,12 @@ describe("install", () => {
     for (const r of [refused, refusedShape, sent]) {
       assert.equal(r.location.includes(code), false);
       assert.equal(JSON.stringify(r.body).includes(code), false);
+      assert.equal((r.headers.get("set-cookie") ?? "").includes(code), false);
     }
     assert.equal(allLogs.some((l) => l.includes(code)), false);
   });
 
-    it("refuses a shop that is not a myshopify.com domain and a link that is not a zlc_ code, back to Zold", async () => {
+  it("refuses a shop that is not a myshopify.com domain and a link that is not a zlc_ code, back to Zold", async () => {
     for (const q of [{ shop: "evil.example.com", link: stub.mintLinkCode(SHOP) }, { shop: SHOP, link: "zlc_short" }, { shop: SHOP, link: "" }]) {
       const r = await call(`/shopify/install?${new URLSearchParams(q)}`);
       assert.equal(r.status, 302);
@@ -176,12 +202,11 @@ describe("install", () => {
   });
 
   it("a callback with a wrong HMAC, an unknown state or another shop stores nothing and fetches no token", async () => {
-    const u = await startInstall(SHOP, stub.mintLinkCode(SHOP));
-    const state = u.searchParams.get("state")!;
+    const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
     const exchanges = stub.exchanges.length;
     const forged = oauthQuery(state, SHOP).replace(/hmac=[0-9a-f]+/, `hmac=${"0".repeat(64)}`);
     for (const q of [forged, oauthQuery("not-a-state", SHOP), oauthQuery(state, SHOP_B)]) {
-      const r = await call(`/shopify/callback?${q}`);
+      const r = await call(`/shopify/callback?${q}`, { headers: cookieHeader(cookie) });
       assert.equal(r.status, 302);
       assert.ok(new URL(r.location).searchParams.get("error"), r.location);
     }
@@ -190,20 +215,113 @@ describe("install", () => {
     assert.equal(store.findShopifyConnectionByShop(SHOP_B), undefined);
   });
 
+  it("a callback without the install's cookie, or with another browser's, is refused before any token is fetched", async () => {
+    const mine = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+    const theirs = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+    const exchanges = stub.exchanges.length;
+    for (const cookie of [undefined, theirs.cookie, "", "x".repeat(43)]) {
+      const r = await callback(mine.state, SHOP, cookie);
+      assert.equal(r.status, 302);
+      assert.match(new URL(r.location).searchParams.get("error")!, /another browser/);
+    }
+    assert.equal(stub.exchanges.length, exchanges);
+    // The refusals did not spend the state: the right browser still continues.
+    assert.equal((await callback(mine.state, SHOP, mine.cookie)).status, 200);
+  });
+
   it("an expired install is refused", async () => {
-    const u = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+    const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
     later(16 * 60_000);
-    const r = await call(`/shopify/callback?${oauthQuery(u.searchParams.get("state")!, SHOP)}`);
+    const r = await callback(state, SHOP, cookie);
     assert.match(new URL(r.location).searchParams.get("error")!, /expired/);
     assert.equal(store.findShopifyConnectionByShop(SHOP), undefined);
   });
 
-  it("Shopify refusing the code exchange stores nothing and leaves the link code unspent", async () => {
-    const u = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+  it("Shopify refusing the code exchange stores nothing and never asks Zold", async () => {
+    const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
     const before = stub.coreCalls.length;
-    const r = await call(`/shopify/callback?${oauthQuery(u.searchParams.get("state")!, SHOP, "bad-code")}`);
+    const r = await callback(state, SHOP, cookie, "bad-code");
     assert.match(new URL(r.location).searchParams.get("error")!, /Shopify refused/);
-    assert.equal(stub.coreCalls.length, before, "the link code was spent on a failed install");
+    assert.equal(stub.coreCalls.length, before, "Zold was asked about a failed install");
+    assert.equal(store.findShopifyConnectionByShop(SHOP), undefined);
+  });
+
+  it("the callback shows the store's admin who is asking, and links nothing until they confirm", async () => {
+    const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+    const exchanges = exchangeCalls();
+    const page = await callback(state, SHOP, cookie);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get("content-type") ?? "", /text\/html/);
+    const csp = page.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /form-action 'self' https:\/\/zold\.example/);
+    assert.match(csp, /frame-ancestors 'none'/);
+    assert.equal(page.headers.get("cache-control"), "no-store");
+    const html = page.body.text as string;
+    for (const shown of [SHOP, "Keycard Demo GmbH", "Keycard (keycard)", "Link this store", "Cancel"]) assert.ok(html.includes(shown), shown);
+    assert.equal(/<script/i.test(html), false);
+    assert.equal(html.includes(ACCESS_TOKEN), false);
+    assert.equal(exchangeCalls(), exchanges, "the link was exchanged before the admin confirmed");
+    assert.equal(store.findShopifyConnectionByShop(SHOP), undefined);
+    assert.equal(existsSync(DB) && readFileSync(DB, "utf8").includes(ACCESS_TOKEN), false);
+  });
+
+  it("escapes every value on the confirmation page", async () => {
+    stub.orgName = `<script>alert(1)</script>"&'`;
+    try {
+      const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+      const html = (await callback(state, SHOP, cookie)).body.text as string;
+      assert.equal(html.includes("<script>alert(1)"), false);
+      assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;&quot;&amp;&#39;"), html);
+    } finally {
+      stub.orgName = "Keycard Demo GmbH";
+    }
+  });
+
+  for (const [name, fail, code, message] of [
+    ["refuses the preview (404 with a code)", { status: 404, body: { error: "no", code: "LINK_CODE_INVALID" } }, "LINK_CODE_INVALID", /did not accept/],
+    ["cannot preview (503)", { status: 503, body: { error: "no credential", code: "SERVICE_UNAVAILABLE" } }, null, /could not be reached/],
+  ] as const) {
+    it(`when Zold ${name}, no page is shown and nothing is stored`, async () => {
+      stub.fail.preview = fail;
+      const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+      const r = await callback(state, SHOP, cookie);
+      assert.equal(r.status, 302);
+      const back = new URL(r.location);
+      assert.match(back.searchParams.get("error")!, message);
+      assert.equal(back.searchParams.get("code"), code);
+      assert.equal(store.findShopifyConnectionByShop(SHOP), undefined);
+    });
+  }
+
+  it("a confirm without the cookie, with another browser's, with a wrong id or after 15 minutes is refused and exchanges nothing", async () => {
+    const mine = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+    const theirs = await startInstall(SHOP_B, stub.mintLinkCode(SHOP_B));
+    const pending = pendingOf(await callback(mine.state, SHOP, mine.cookie));
+    const exchanges = exchangeCalls();
+    for (const [id, cookie] of [[pending, undefined], [pending, theirs.cookie], ["x".repeat(32), mine.cookie], ["../etc", mine.cookie]] as const) {
+      const r = await confirmInstall(id, cookie);
+      assert.equal(r.status, 302);
+      assert.match(new URL(r.location).searchParams.get("error")!, /expired or was opened in another browser/);
+    }
+    assert.equal(exchangeCalls(), exchanges);
+    later(16 * 60_000);
+    const late = await confirmInstall(pending, mine.cookie);
+    assert.match(new URL(late.location).searchParams.get("error")!, /expired/);
+    assert.equal(exchangeCalls(), exchanges);
+    assert.equal(store.findShopifyConnectionByShop(SHOP), undefined);
+  });
+
+  it("Cancel links nothing, spends no code, and the page cannot be answered twice", async () => {
+    const { state, cookie } = await startInstall(SHOP, stub.mintLinkCode(SHOP));
+    const pending = pendingOf(await callback(state, SHOP, cookie));
+    const exchanges = exchangeCalls();
+    const r = await confirmInstall(pending, cookie, "cancel");
+    assert.match(new URL(r.location).searchParams.get("error")!, /not linked/);
+    assert.match(r.headers.get("set-cookie") ?? "", new RegExp(`${INSTALL_COOKIE}=;`));
+    const again = await confirmInstall(pending, cookie, "link");
+    assert.match(new URL(again.location).searchParams.get("error")!, /expired/);
+    assert.equal(exchangeCalls(), exchanges);
     assert.equal(store.findShopifyConnectionByShop(SHOP), undefined);
   });
 
@@ -212,7 +330,7 @@ describe("install", () => {
     ["answers 500", { status: 500 }, null, /could not be reached/],
     ["answers 503", { status: 503, body: { error: "no credential", code: "SERVICE_UNAVAILABLE" } }, null, /could not be reached/],
   ] as const) {
-    it(`when Zold ${name}, the Shopify token that was already exchanged is not stored`, async () => {
+    it(`when Zold ${name} at confirm, the Shopify token that was already exchanged is not stored`, async () => {
       stub.fail.exchange = fail;
       const exchanges = stub.exchanges.length;
       const r = await connect(SHOP);
@@ -225,7 +343,7 @@ describe("install", () => {
     });
   }
 
-  it("connects: seals the token and link secret, subscribes three topics at our webhook URL, and returns to Zold", async () => {
+  it("connects on confirm: seals the token and link secret, subscribes three topics at our webhook URL, and returns to Zold", async () => {
     const r = await connect(SHOP, "link-a");
     assert.equal(r.location, `${CORE_PUBLIC}/business?view=shopify&shop=${SHOP}`);
     const c = store.findShopifyConnectionByShop(SHOP)!;
@@ -311,10 +429,13 @@ describe("Shopify webhooks", () => {
     assert.equal(sent.authorization, `Bearer ${SERVICE_TOKEN}`);
     assert.equal(sent.body.amountEur, 20);
     assert.equal(sent.body.test, true);
-    assert.deepEqual(sent.body.order, { gid: o.admin_graphql_api_id, name: o.name, statusUrl: o.order_status_url });
+    assert.deepEqual(sent.body.order, { gid: o.admin_graphql_api_id, name: o.name });
     assert.equal(sent.body.shop, undefined);
-    assert.equal(JSON.stringify(sent.body).includes("buyer@example.com"), false, "the buyer's details went to Zold");
+    for (const buyer of ["buyer@example.com", o.order_status_url, "authenticate?key"]) {
+      assert.equal(JSON.stringify(sent.body).includes(buyer), false, "the buyer's details went to Zold");
+    }
     const saved = row(o)!;
+    assert.equal(saved.amountEur, 20);
     assert.equal(saved.state, "OPEN");
     assert.equal(saved.linkId, "link-a");
     assert.ok(saved.checkoutTokenHash && saved.checkoutTokenHash !== o.checkout_token);
@@ -328,11 +449,14 @@ describe("Shopify webhooks", () => {
     assert.notEqual(opens().at(-1)!.body.amountEur, 0);
   });
 
-  it("drops an order status URL that is not https", async () => {
-    for (const url of ["http://shop.example/s", "javascript:alert(1)", "not a url"]) {
-      await webhook("orders/create", order({ order_status_url: url }));
-      assert.equal(opens().at(-1)!.body.order.statusUrl, undefined, url);
-    }
+  it("strips control characters from the order name before it is sent, stored or logged", async () => {
+    const o = order({ name: "#9\n\u0000SHOPIFY_DISABLED fake\u2028" });
+    await webhook("orders/create", o);
+    assert.equal(opens().at(-1)!.body.order.name, "#9SHOPIFY_DISABLED fake");
+    assert.equal(row(o)!.orderName, "#9SHOPIFY_DISABLED fake");
+    const long = order({ name: "#".repeat(41) });
+    await webhook("orders/create", long);
+    assert.equal(row(long)!.orderName, undefined);
   });
 
   it("a redelivery of the same order opens nothing new; concurrent deliveries open one", async () => {
@@ -376,13 +500,18 @@ describe("Shopify webhooks", () => {
     const o = order();
     await webhook("orders/create", o);
     const a = row(o)!;
-    const cancelled = await webhook("orders/cancelled", o, { shop: SHOP_B });
-    assert.equal(cancelled.body.cancelled, false);
-    assert.equal(stub.requests.get(a.paymentRequestId)!.state, "OPEN");
     await webhook("orders/create", o, { shop: SHOP_B });
     const b = row(o, SHOP_B)!;
-    assert.notEqual(b.paymentRequestId, a.paymentRequestId);
+    assert.notEqual(b.paymentRequestId, a.paymentRequestId, "store B's order was deduped against store A's");
     assert.equal(b.linkId, "link-b");
+    const cancelled = await webhook("orders/cancelled", o, { shop: SHOP_B });
+    assert.equal(cancelled.body.cancelled, true);
+    assert.equal(stub.requests.get(b.paymentRequestId)!.state, "CANCELLED");
+    assert.equal(stub.requests.get(a.paymentRequestId)!.state, "OPEN", "store B cancelled store A's request");
+    // A cancel for an order store C never sent leaves A's alone, and blocks only C's.
+    const tomb = order();
+    await webhook("orders/cancelled", tomb, { shop: SHOP_B });
+    assert.equal((await webhook("orders/create", tomb)).body.opened, true);
   });
 
   for (const status of [500, 502, 503, 429, 401]) {
@@ -480,8 +609,31 @@ describe("orders/cancelled", () => {
     assert.ok(store.shopifyOrdersAwaitingSettlement().some((x) => x.orderGid === o.admin_graphql_api_id));
   });
 
-  it("an order we never opened is acknowledged", async () => {
-    assert.deepEqual((await webhook("orders/cancelled", order())).body, { ok: true, cancelled: false });
+  it("an order we never opened is acknowledged, and its orders/create arriving later opens nothing", async () => {
+    const o = order();
+    assert.deepEqual((await webhook("orders/cancelled", o)).body, { ok: true, cancelled: false });
+    const before = opens().length;
+    const r = await webhook("orders/create", o);
+    assert.equal(r.body.ignored, "cancelled");
+    assert.equal(opens().length, before);
+    assert.equal(row(o), undefined);
+    // The tombstone is per shop, and lasts 72 hours.
+    later(73 * 3_600_000);
+    assert.equal((await webhook("orders/create", o)).body.opened, true);
+  });
+
+  it("a cancel that arrives while the request is being opened cancels it once it is", async () => {
+    const o = order();
+    let release = () => {};
+    stub.holdOpen.promise = new Promise<void>((r) => (release = r));
+    const creating = webhook("orders/create", o);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal((await webhook("orders/cancelled", o)).body.cancelled, false);
+    stub.holdOpen.promise = undefined;
+    release();
+    assert.equal((await creating).body.cancelled, true);
+    assert.equal(row(o)!.state, "CANCELLED");
+    assert.equal(stub.requests.get(row(o)!.paymentRequestId)!.state, "CANCELLED");
   });
 
   it("Zold down is retried (503); a refusal with a code is acknowledged", async () => {
@@ -512,13 +664,24 @@ describe("buyer routes", () => {
     assert.equal(r.headers.get("access-control-allow-origin"), "*");
     assert.equal(r.headers.get("cache-control"), "no-store");
     assert.match(r.headers.get("x-robots-tag") ?? "", /noindex/);
-    assert.equal(r.body.amountEur, 129);
-    assert.equal(r.body.orderName, o.name);
-    assert.equal(r.body.pageUrl, row(o)!.pageUrl);
-    for (const k of ["code", "returnUrl", "cancelUrl"]) assert.equal(r.body[k], undefined, k);
-    assert.equal(r.body.payments.length, 1);
-    assert.equal(r.body.payments[0].txHash, undefined);
-    assert.equal(JSON.stringify(r.body).includes("ab".repeat(32)), false);
+    assert.deepEqual(r.body, {
+      state: "OPEN", amountEur: 129, outstandingEur: 129, currency: "EUR", test: false, expiresAt: "2026-10-12T09:00:00.000Z",
+      methods: {
+        crypto: {
+          chainId: 8453, address: `0x${"11".repeat(20)}`, amountUsdc: 146.8, rate: 1.138, allowanceBps: 50,
+          validUntil: "2026-10-11T09:10:00.000Z", uri: "ethereum:0x11@8453",
+          token: { symbol: "USDC", chainName: "Base", decimals: 6, address: `0x${"22".repeat(20)}` },
+        },
+      },
+      payments: [{ method: "crypto", amountUsdc: 146.8, at: "2026-10-11T10:00:00.000Z" }],
+      pageUrl: row(o)!.pageUrl,
+      orderName: o.name,
+    });
+    // Built field by field: what Zold adds there does not pass through.
+    const text = JSON.stringify(r.body);
+    for (const absent of ["somethingNew", "qrUrl", "displayName", "DE89370400440532013000", "bank", "payerAddress", "ab".repeat(32), "code", "returnUrl"]) {
+      assert.equal(text.includes(absent), false, absent);
+    }
     assert.equal((await lookup(SHOP, o.admin_graphql_api_id, o.checkout_token)).status, 200, "the gid form");
   });
 
@@ -625,10 +788,51 @@ describe("settlement", () => {
     assert.equal(facts.amountEur, 129);
     assert.equal(facts.code, row(o)!.code);
     assert.ok(facts.payments[0].txHash.startsWith("0x"));
+    assert.equal(row(o)!.checkoutTokenHash, undefined, "the buyer's proof outlived the order");
+    assert.equal((await call(`/shopify/orders/${SHOP}/${o.id}?t=${o.checkout_token}`)).status, 404);
     later(7_200_000);
     await settle();
     assert.equal(marks(o.admin_graphql_api_id).length, 1, "marked twice");
     assert.equal(svc.settler.nudge("link-a", id), false);
+  });
+
+  it("an order the merchant already marked paid by hand counts as marked, and still gets the metafield", async () => {
+    const o = order();
+    await webhook("orders/create", o);
+    stub.setState(row(o)!.paymentRequestId, "PAID", true);
+    stub.fail.markPaid.push("alreadyPaid");
+    later(7_200_000);
+    await settle();
+    assert.ok(row(o)!.markedPaidAt);
+    assert.equal(row(o)!.lastError, undefined);
+    assert.ok(logs.some((l) => l.includes("already marked paid in Shopify")));
+    assert.ok(stub.shopifyCalls.some((c) => c.op === "metafieldsSet" && c.vars.metafields[0].ownerId === o.admin_graphql_api_id));
+  });
+
+  it("a userError on an order that is not paid in Shopify stays a failure", async () => {
+    const o = order();
+    await webhook("orders/create", o);
+    stub.setState(row(o)!.paymentRequestId, "PAID", true);
+    stub.fail.markPaid.push("userError");
+    later(7_200_000);
+    await settle();
+    assert.equal(row(o)!.markedPaidAt, undefined);
+    assert.ok(stub.shopifyCalls.some((c) => c.op === "order" && c.vars.id === o.admin_graphql_api_id), "the order's status was not read");
+  });
+
+  it("refuses to mark an order paid when Zold's request is for another amount", async () => {
+    const o = order();
+    await webhook("orders/create", o);
+    const id = row(o)!.paymentRequestId;
+    stub.setState(id, "PAID", true);
+    stub.requests.set(id, { ...stub.requests.get(id)!, amountEur: 1.29 });
+    later(7_200_000);
+    await settle();
+    later(7_200_000);
+    await settle();
+    assert.equal(row(o)!.markedPaidAt, undefined);
+    assert.equal(marks(o.admin_graphql_api_id).length, 0);
+    assert.equal(logs.filter((l) => l.startsWith("SHOPIFY_AMOUNT_MISMATCH")).length, 1);
   });
 
   it("a refused metafield does not undo the mark", async () => {
@@ -693,6 +897,7 @@ describe("settlement", () => {
     later(7_200_000);
     await settle();
     assert.equal(row(o)!.state, "EXPIRED");
+    assert.equal(row(o)!.checkoutTokenHash, undefined, "the buyer's proof outlived the order");
     assert.equal(marks(o.admin_graphql_api_id).length, 0);
     assert.equal(store.shopifyOrdersAwaitingSettlement().some((x) => x.orderGid === o.admin_graphql_api_id), false);
   });
@@ -744,18 +949,25 @@ describe("settlement", () => {
     assert.equal(logs.filter((l) => l.startsWith("SHOPIFY_SETTLE_MISMATCH")).length, 1);
   });
 
-  it("does not mark an order of a store that uninstalled the app", async () => {
-    await connect("uninstalled.myshopify.com", "link-u");
+  it("an uninstall closes the store's orders: out of settlement, buyer proofs and the access token dropped", async () => {
+    const U = "uninstalled.myshopify.com";
+    await connect(U, "link-u");
     const o = order();
-    await webhook("orders/create", o, { shop: "uninstalled.myshopify.com" });
-    stub.setState(row(o, "uninstalled.myshopify.com")!.paymentRequestId, "PAID", true);
-    assert.equal((await webhook("app/uninstalled", { id: 1 }, { shop: "uninstalled.myshopify.com" })).status, 200);
+    await webhook("orders/create", o, { shop: U });
+    stub.setState(row(o, U)!.paymentRequestId, "PAID", true);
+    assert.equal((await webhook("app/uninstalled", { id: 1 }, { shop: U })).status, 200);
+    const c = store.findShopifyConnectionByShop(U)!;
+    assert.equal(c.accessTokenEnc, undefined, "the revoked token is still kept");
+    assert.deepEqual(c.webhookSubscriptionIds, []);
+    assert.equal(row(o, U)!.checkoutTokenHash, undefined);
+    assert.equal(store.shopifyOrdersAwaitingSettlement().some((x) => x.shop === U), false);
     later(7_200_000);
     await settle();
-    const r = row(o, "uninstalled.myshopify.com")!;
-    assert.equal(r.markedPaidAt, undefined);
-    assert.equal(r.lastError, "the store is not connected");
+    assert.equal(row(o, U)!.markedPaidAt, undefined);
     assert.equal(marks(o.admin_graphql_api_id).length, 0);
+    // Nothing for a disabled store needs its token: a revoked-link hint does not try.
+    stub.links.get("link-u")!.active = false;
+    await svc.onLinkHint("link-u");
   });
 });
 
@@ -770,6 +982,18 @@ describe("disabling a connection", () => {
     const o = order();
     assert.equal((await webhook("orders/create", o, { shop: "leaving.myshopify.com" })).body.ignored, "connection disabled");
     assert.equal(opens().length, before);
+  });
+
+  it("an app/uninstalled triggered before the current install is ignored", async () => {
+    await connect("reinstalled.myshopify.com", "link-ri");
+    const installedAt = store.findShopifyConnectionByShop("reinstalled.myshopify.com")!.installedAt;
+    const stale = new Date(Date.parse(installedAt) - 60_000).toISOString();
+    const r = await webhook("app/uninstalled", { id: 1 }, { shop: "reinstalled.myshopify.com", headers: { "x-shopify-triggered-at": stale } });
+    assert.equal(r.body.ignored, "uninstall before this install");
+    assert.equal(store.findShopifyConnectionByShop("reinstalled.myshopify.com")!.disabledAt, undefined);
+    const fresh = new Date(Date.parse(installedAt) + 60_000).toISOString();
+    await webhook("app/uninstalled", { id: 1 }, { shop: "reinstalled.myshopify.com", headers: { "x-shopify-triggered-at": fresh } });
+    assert.equal(store.findShopifyConnectionByShop("reinstalled.myshopify.com")!.disabledReason, "app_uninstalled");
   });
 
   it("LINK_REVOKED from Zold disables the connection and removes its webhook subscriptions", async () => {
@@ -811,27 +1035,6 @@ describe("disabling a connection", () => {
     assert.equal(settled.linkId, "link-old");
     assert.ok(settled.markedPaidAt, "the order of the old link was not settled");
     assert.ok(stub.coreCalls.some((c) => c.path === `/api/service/merchant/links/link-old/payment-requests/${first.paymentRequestId}`));
-  });
-
-  it("ORDER_TAKEN for an order whose row appeared while Zold answered is 'already opened', and the row is kept", async () => {
-    const o = order();
-    let release = () => {};
-    stub.holdOpen.promise = new Promise<void>((r) => (release = r));
-    stub.fail.open.push({ status: 409, body: { error: "taken", code: "ORDER_TAKEN" } });
-    const pending = webhook("orders/create", o);
-    await new Promise((r) => setTimeout(r, 50));
-    const at = new Date(clock).toISOString();
-    const kept = store.addShopifyOrder({
-      shop: SHOP, orderGid: o.admin_graphql_api_id, linkId: "link-old-a", paymentRequestId: "pr-kept", handle: "keycard",
-      code: "ABCDE-00000-XYZWV", publicPath: "/api/pay/keycard/ABCDE-00000-XYZWV", pageUrl: "https://zold.example/pay/keycard/ABCDE-00000-XYZWV",
-      state: "OPEN", markPaidAttempts: 0, createdAt: at, updatedAt: at,
-    });
-    stub.holdOpen.promise = undefined;
-    release();
-    const r = await pending;
-    assert.equal(r.status, 200);
-    assert.equal(r.body.existing, true);
-    assert.deepEqual(row(o), kept);
   });
 
   it("a reconnect through a new link enables the connection again", async () => {

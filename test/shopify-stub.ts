@@ -33,6 +33,12 @@ type Fail = { status: number; body?: unknown } | undefined;
 
 export interface Stub {
   base: string;
+  /** Zold's public origin the stub's pay page URLs are on (CORE_PUBLIC_URL). */
+  publicOrigin: string;
+  /** The organisation name the link preview answers with. */
+  orgName: string;
+  /** Orders Shopify considers paid (the order status query). */
+  paidOrders: Set<string>;
   close: () => void;
   /** Calls as they arrived: Shopify GraphQL ops and Zold service paths. */
   shopifyCalls: { shop: string; op: string; vars: any }[];
@@ -43,12 +49,13 @@ export interface Stub {
   /** Next answers to force, one each. */
   fail: {
     exchange?: Fail;
+    preview?: Fail;
     open: Fail[];
     read: Fail[];
     cancel: Fail[];
     publicRead: Fail[];
     linkRead: Fail[];
-    markPaid: ("userError" | "http500")[];
+    markPaid: ("userError" | "http500" | "alreadyPaid")[];
     metafield: ("userError")[];
     subscribe: string[];
   };
@@ -62,10 +69,13 @@ export interface Stub {
 }
 
 export async function startStub(): Promise<Stub> {
-  const pending = new Map<string, { linkId: string; shop: string }>();
+  const pending = new Map<string, { linkId: string; shop: string; previewed: boolean }>();
   let seq = 0;
   const stub: Stub = {
     base: "",
+    publicOrigin: "https://zold.example",
+    orgName: "Keycard Demo GmbH",
+    paidOrders: new Set(),
     close: () => {},
     shopifyCalls: [],
     coreCalls: [],
@@ -75,7 +85,7 @@ export async function startStub(): Promise<Stub> {
     fail: { open: [], read: [], cancel: [], publicRead: [], linkRead: [], markPaid: [], metafield: [], subscribe: [] },
     mintLinkCode: (shop, linkId = `link-${++seq}`) => {
       const code = `zlc_${randomBytes(32).toString("base64url")}`;
-      pending.set(code, { linkId, shop });
+      pending.set(code, { linkId, shop, previewed: false });
       return code;
     },
     setState: (id, state, payment = false) => {
@@ -122,7 +132,7 @@ export async function startStub(): Promise<Stub> {
     }
     if (/^admin\/api\/\d{4}-\d{2}\/graphql\.json$/.test(p)) {
       if (headers["x-shopify-access-token"] !== ACCESS_TOKEN) return [401, { errors: "Invalid API key or access token" }];
-      const op = /mutation \w+\(.*?\)\s*\{\s*(\w+)/s.exec(json.query)?.[1] ?? "?";
+      const op = /(?:mutation|query) \w+\(.*?\)\s*\{\s*(\w+)/s.exec(json.query)?.[1] ?? "?";
       stub.shopifyCalls.push({ shop, op, vars: json.variables });
       return graphql(shop, op, json.variables);
     }
@@ -139,10 +149,18 @@ export async function startStub(): Promise<Stub> {
       return [200, { data: { webhookSubscriptionCreate: { webhookSubscription: { id: `gid://shopify/WebhookSubscription/${vars.topic}` }, userErrors: [] } } }];
     }
     if (op === "webhookSubscriptionDelete") return [200, { data: { webhookSubscriptionDelete: { deletedWebhookSubscriptionId: vars.id, userErrors: [] } } }];
+    if (op === "order") {
+      return [200, { data: { order: { id: vars.id, displayFinancialStatus: stub.paidOrders.has(vars.id) ? "PAID" : "PENDING" } } }];
+    }
     if (op === "orderMarkAsPaid") {
       const f = stub.fail.markPaid.shift();
+      if (f === "alreadyPaid") {
+        stub.paidOrders.add(vars.input.id);
+        return [200, { data: { orderMarkAsPaid: { order: null, userErrors: [{ message: "Order has already been paid" }] } } }];
+      }
       if (f === "http500") return [500, { errors: "Internal error" }];
       if (f === "userError") return [200, { data: { orderMarkAsPaid: { order: null, userErrors: [{ message: "Order cannot be marked as paid" }] } } }];
+      stub.paidOrders.add(vars.input.id);
       return [200, { data: { orderMarkAsPaid: { order: { id: vars.input.id, displayFinancialStatus: "PAID" }, userErrors: [] } } }];
     }
     if (op === "metafieldsSet") {
@@ -162,14 +180,35 @@ export async function startStub(): Promise<Stub> {
       return [200, {
         code: v.code, handle: v.handle, state: v.state, amountEur: v.amountEur, currency: "EUR",
         returnUrl: "https://shop.example/return", cancelUrl: "https://shop.example/cancel",
-        methods: { crypto: { address: `0x${"11".repeat(20)}`, amountUsdc: 146.8 } },
-        payments: v.payments.map((p) => ({ method: p.method, amountUsdc: p.amountUsdc, txHash: p.txHash, at: p.at })),
+        test: v.test ?? false, expiresAt: "2026-10-12T09:00:00.000Z", outstandingEur: v.amountEur, displayName: "Keycard",
+        qrUrl: "https://zold.example/qr.png", payeeIban: "DE89370400440532013000", somethingNew: { secret: true },
+        methods: {
+          crypto: {
+            chainId: 8453, address: `0x${"11".repeat(20)}`, amountUsdc: 146.8, rate: 1.138, allowanceBps: 50,
+            validUntil: "2026-10-11T09:10:00.000Z", uri: "ethereum:0x11@8453", qrUrl: "https://zold.example/qr.png",
+            token: { symbol: "USDC", chainName: "Base", decimals: 6, address: `0x${"22".repeat(20)}`, extra: "x" },
+          },
+          bank: { iban: "DE89370400440532013000", name: "Keycard Demo GmbH" },
+        },
+        payments: v.payments.map((p) => ({ method: p.method, amountUsdc: p.amountUsdc, txHash: p.txHash, at: p.at, payerAddress: "0xbuyer" })),
       }];
     }
     if (headers.authorization !== `Bearer ${SERVICE_TOKEN}`) return [401, { error: "bad credential" }];
+    if (method === "POST" && path === "/api/service/merchant/links/preview") {
+      const p = pending.get(body.code);
+      if (stub.fail.preview) {
+        const f = stub.fail.preview;
+        stub.fail.preview = undefined;
+        return failWith(f);
+      }
+      if (!p || p.shop !== body.shop) return [404, { error: "unknown code", code: "LINK_CODE_INVALID" }];
+      p.previewed = true;
+      return [200, { shop: p.shop, orgName: stub.orgName, payeeHandle: "keycard", payeeDisplayName: "Keycard", expiresAt: "2026-10-11T09:15:00.000Z" }];
+    }
     if (method === "POST" && path === "/api/service/merchant/links/exchange") {
       const p = pending.get(body.code);
       pending.delete(body.code);
+      if (p && !p.previewed) return [409, { error: "not confirmed", code: "LINK_NOT_CONFIRMED" }];
       if (stub.fail.exchange) {
         const f = stub.fail.exchange;
         stub.fail.exchange = undefined;
@@ -204,7 +243,7 @@ export async function startStub(): Promise<Stub> {
         id, code: display, handle: "keycard", state: "OPEN", amountEur: body.amountEur, currency: "EUR",
         ...(body.test ? { test: true } : {}), createdAt: "2026-10-11T09:00:00.000Z",
         order: { gid: body.order.gid, ...(body.order.name ? { name: body.order.name } : {}) }, shop: link.shop, payments: [],
-        pageUrl: `https://zold.example/pay/keycard/${display}`, publicPath: `/api/pay/keycard/${display}`,
+        pageUrl: `${stub.publicOrigin}/pay/keycard/${display}`, publicPath: `/api/pay/keycard/${display}`,
       };
       stub.requests.set(id, v);
       const over = stub.openOverride.shift();

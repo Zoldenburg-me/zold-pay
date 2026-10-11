@@ -157,7 +157,8 @@ export interface ShopifyConnection {
   shop: string;
   /** The Zold merchant link this store opens payment requests under. */
   linkId: string;
-  accessTokenEnc: string;
+  /** Absent after the store uninstalled the app: Shopify revoked it, so it is not kept. */
+  accessTokenEnc?: string;
   linkSecretEnc: string;
   scope: string;
   installedAt: string;
@@ -184,8 +185,11 @@ export interface ShopifyOrder {
   /** Zold's public projection of the request, `/api/pay/<handle>/<code>`. */
   publicPath: string;
   pageUrl: string;
+  /** The amount the request was opened for; "Mark as paid" is refused if Zold's view differs. */
+  amountEur: number;
+  /** Shopify's order name, control characters removed. */
   orderName?: string;
-  /** SHA-256 of the order's checkout token, the thank-you page's proof. */
+  /** SHA-256 of the order's checkout token, the thank-you page's proof. Dropped once the order is closed or marked paid. */
   checkoutTokenHash?: string;
   /** Zold's effective state of the request when last read (OPEN, PAID, CANCELLED, EXPIRED...). */
   state: string;
@@ -201,6 +205,18 @@ export interface ShopifyOrder {
 
 /** Zold states after which nothing more can happen to an unpaid order's request. */
 export const SHOPIFY_CLOSED_STATES: ReadonlySet<string> = new Set(["CANCELLED", "EXPIRED"]);
+
+/** How long a settled or closed Shopify order is kept, counted from its last change. */
+export const SHOPIFY_ORDER_RETENTION_MS = 90 * 24 * 60 * 60_000;
+
+/**
+ * Nothing more will happen to this order here: marked paid, its request closed
+ * at Zold, or its store uninstalled the app (no token to mark it with).
+ */
+function shopifyOrderClosed(o: ShopifyOrder, connections: readonly ShopifyConnection[]): boolean {
+  if (o.markedPaidAt || SHOPIFY_CLOSED_STATES.has(o.state)) return true;
+  return connections.find((c) => c.shop === o.shop)?.disabledReason === "app_uninstalled";
+}
 
 interface Db {
   merchants: Merchant[];
@@ -398,10 +414,10 @@ export const store = {
       return !(DEAD_STATUSES.has(i.status) && olderThan(DEAD_INTENT_MAX_AGE_MS));
     });
     const purged = purgeStalePayerNames(kept, now);
-    // A Shopify order is kept while Zold may still be paid for it or the store
-    // not yet told; once it is settled either way, as long as a checkout.
+    // A Shopify order is kept while Zold may still be paid for it and the store
+    // can be told; once closed, for 90 days after its last change.
     const orders = db.shopifyOrders.filter(
-      (o) => !((o.markedPaidAt || SHOPIFY_CLOSED_STATES.has(o.state)) && now - Date.parse(o.createdAt) > SETTLED_INTENT_MAX_AGE_MS),
+      (o) => !(shopifyOrderClosed(o, db.shopifyConnections) && now - Date.parse(o.updatedAt) > SHOPIFY_ORDER_RETENTION_MS),
     );
     if (kept.length !== db.paymentIntents.length || purged.changed || orders.length !== db.shopifyOrders.length) {
       commit({ ...db, paymentIntents: purged.intents, shopifyOrders: orders });
@@ -482,13 +498,25 @@ export const store = {
   updateShopifyOrder(shop: string, orderGid: string, patch: Partial<ShopifyOrder>) {
     const old = store.findShopifyOrder(shop, orderGid);
     if (!old) throw new Error("shopify order not found");
-    const updated = patched(old, patch);
+    let updated = patched(old, patch);
+    // The buyer's proof is needed only while the order can still be paid.
+    if (updated.checkoutTokenHash && (updated.markedPaidAt || SHOPIFY_CLOSED_STATES.has(updated.state))) {
+      updated = withoutKeys(updated, "checkoutTokenHash");
+    }
     commit({ ...db, shopifyOrders: db.shopifyOrders.map((x) => (x === old ? updated : x)) });
     return updated;
   },
+  /**
+   * A store uninstalled the app: its orders are closed here. Their buyers'
+   * proofs are dropped and their 90 days start now.
+   */
+  closeShopifyOrdersOf(shop: string) {
+    const at = new Date().toISOString();
+    const next = db.shopifyOrders.map((o) => (o.shop === shop ? { ...withoutKeys(o, "checkoutTokenHash"), updatedAt: at } : o));
+    commit({ ...db, shopifyOrders: next });
+  },
   /** Orders whose request can still be paid, or was paid and the store has not been told. */
-  shopifyOrdersAwaitingSettlement: () =>
-    db.shopifyOrders.filter((o) => !o.markedPaidAt && !SHOPIFY_CLOSED_STATES.has(o.state)),
+  shopifyOrdersAwaitingSettlement: () => db.shopifyOrders.filter((o) => !shopifyOrderClosed(o, db.shopifyConnections)),
 };
 
 /** A new record with `patch` applied; `undefined` deletes the key. */

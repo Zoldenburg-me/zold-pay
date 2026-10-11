@@ -130,17 +130,34 @@ export function createShopifyAdmin(opts: ShopifyAdminOptions) {
     refuseOnUserErrors(data?.webhookSubscriptionDelete, "webhookSubscriptionDelete");
   }
 
+  /** The order's financial status as the Shopify admin shows it (PENDING, PAID, ...). */
+  async function orderFinancialStatus(shop: string, token: string, orderGid: string): Promise<string | undefined> {
+    const data = await adminGraphql(shop, token, `
+      query OrderStatus($id: ID!) {
+        order(id: $id) { id displayFinancialStatus }
+      }`, { id: orderGid });
+    const status = data?.order?.displayFinancialStatus;
+    return typeof status === "string" ? status : undefined;
+  }
+
   /**
    * The merchant's "Mark as paid", pressed by us once Zold says the request is
    * paid. Valid for an order whose payment is pending, which is what a manual
-   * payment method leaves it in.
+   * payment method leaves it in. Refused because the order is already PAID
+   * (the merchant pressed it by hand) is success: the order is paid.
    */
-  async function orderMarkAsPaid(shop: string, token: string, orderGid: string): Promise<void> {
+  async function orderMarkAsPaid(shop: string, token: string, orderGid: string): Promise<{ alreadyPaid: boolean }> {
     const data = await adminGraphql(shop, token, `
       mutation MarkPaid($input: OrderMarkAsPaidInput!) {
         orderMarkAsPaid(input: $input) { order { id displayFinancialStatus } userErrors { field message } }
       }`, { input: { id: orderGid } });
-    refuseOnUserErrors(data?.orderMarkAsPaid, "orderMarkAsPaid");
+    try {
+      refuseOnUserErrors(data?.orderMarkAsPaid, "orderMarkAsPaid");
+      return { alreadyPaid: false };
+    } catch (err) {
+      if ((await orderFinancialStatus(shop, token, orderGid)) === "PAID") return { alreadyPaid: true };
+      throw err;
+    }
   }
 
   /** The payment's facts on the order, where the merchant looks: a `zold.payment` JSON metafield. */

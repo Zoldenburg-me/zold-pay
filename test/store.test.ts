@@ -245,7 +245,7 @@ describe("Shopify rows", () => {
   const order = (over: Record<string, unknown> = {}) => ({
     shop: "a.myshopify.com", orderGid: "gid://shopify/Order/1", linkId: "l1", paymentRequestId: "pr1", handle: "h",
     code: "ABCDE-FGHIJ-KLMNO", publicPath: "/api/pay/h/ABCDE-FGHIJ-KLMNO", pageUrl: "https://z.example/pay/h/ABCDE-FGHIJ-KLMNO",
-    state: "OPEN", markPaidAttempts: 0, createdAt: NOW, updatedAt: NOW, ...over,
+    amountEur: 12.5, state: "OPEN", markPaidAttempts: 0, createdAt: NOW, updatedAt: NOW, ...over,
   });
 
   it("keeps one connection per shop and finds orders only with their shop", () => {
@@ -263,15 +263,53 @@ describe("Shopify rows", () => {
     assert.throws(() => store.updateShopifyConnection("nope", { scope: "" }), /not found/);
   });
 
-  it("sweeps settled Shopify orders after 90 days and keeps open or unmarked paid ones", () => {
+  it("sweeps closed Shopify orders 90 days after their last change, and keeps open or unmarked paid ones", () => {
     initStore(tmpDb());
     const old = "2020-01-01T00:00:00.000Z";
-    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/1", state: "PAID", markedPaidAt: old, createdAt: old }));
-    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/2", state: "EXPIRED", createdAt: old }));
-    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/3", state: "PAID", createdAt: old }));
-    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/4", state: "OPEN", createdAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/1", state: "PAID", markedPaidAt: old, createdAt: old, updatedAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/2", state: "EXPIRED", createdAt: old, updatedAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/3", state: "PAID", createdAt: old, updatedAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/4", state: "OPEN", createdAt: old, updatedAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/5", state: "EXPIRED", createdAt: old }));
     store.sweep();
-    const left = ["1", "2", "3", "4"].filter((n) => store.findShopifyOrder("a.myshopify.com", `gid://shopify/Order/${n}`));
-    assert.deepEqual(left, ["3", "4"]);
+    const left = ["1", "2", "3", "4", "5"].filter((n) => store.findShopifyOrder("a.myshopify.com", `gid://shopify/Order/${n}`));
+    assert.deepEqual(left, ["3", "4", "5"]);
+  });
+
+  it("drops the buyer's proof once an order is closed or marked paid", () => {
+    initStore(tmpDb());
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/1", checkoutTokenHash: "a".repeat(64) }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/2", checkoutTokenHash: "b".repeat(64) }));
+    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/1", { state: "PAID" });
+    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1")!.checkoutTokenHash, "a".repeat(64), "dropped while still unmarked");
+    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/1", { markedPaidAt: NOW });
+    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/2", { state: "CANCELLED" });
+    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1")!.checkoutTokenHash, undefined);
+    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/2")!.checkoutTokenHash, undefined);
+  });
+
+  it("an uninstalled store's orders are closed: out of settlement, proofs dropped, swept 90 days after the uninstall", () => {
+    const file = tmpDb();
+    initStore(file);
+    const old = "2020-01-01T00:00:00.000Z";
+    store.saveShopifyConnection(conn());
+    store.addShopifyOrder(order({ checkoutTokenHash: "c".repeat(64), createdAt: old, updatedAt: old }));
+    store.addShopifyOrder(order({ shop: "b.myshopify.com", createdAt: old, updatedAt: old }));
+    assert.equal(store.shopifyOrdersAwaitingSettlement().length, 2);
+    store.updateShopifyConnection("c1", { disabledAt: NOW, disabledReason: "app_uninstalled" });
+    store.closeShopifyOrdersOf("a.myshopify.com");
+    assert.deepEqual(store.shopifyOrdersAwaitingSettlement().map((o) => o.shop), ["b.myshopify.com"]);
+    const closed = store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1")!;
+    assert.equal(closed.checkoutTokenHash, undefined);
+    store.sweep();
+    assert.ok(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1"), "swept before its 90 days");
+    // 91 days on, as written to disk.
+    const disk = JSON.parse(readFileSync(file, "utf8"));
+    disk.shopifyOrders = disk.shopifyOrders.map((o: { updatedAt: string }) => ({ ...o, updatedAt: old }));
+    writeFileSync(file, JSON.stringify(disk));
+    initStore(file);
+    store.sweep();
+    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1"), undefined);
+    assert.ok(store.findShopifyOrder("b.myshopify.com", "gid://shopify/Order/1"));
   });
 });

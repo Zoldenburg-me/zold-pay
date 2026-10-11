@@ -22,7 +22,7 @@ process.env.SHOPIFY_API_KEY = "app-key";
 process.env.SHOPIFY_API_SECRET = "app-secret";
 process.env.SHOPIFY_TOKEN_KEY = randomBytes(32).toString("base64");
 process.env.SHOPIFY_SHOP_BASE_URL = stub.base;
-process.env.CORE_PUBLIC_URL = "http://localhost:3000";
+process.env.CORE_PUBLIC_URL = "https://zold.example";
 process.env.RATE_LIMIT_GENERAL = "1000";
 process.env.RATE_LIMIT_CREDENTIAL = "1000";
 
@@ -77,10 +77,23 @@ describe("Shopify wiring", () => {
     const link = stub.mintLinkCode(SHOP, "link-w");
     const install = await fetch(`${base}/shopify/install?${new URLSearchParams({ shop: SHOP, link })}`, { redirect: "manual" });
     assert.equal(install.status, 302);
+    const cookie = (install.headers.get("set-cookie") ?? "").split(";")[0];
+    assert.match(cookie, /^__Host-zold-shopify-install=/);
     const state = new URL(install.headers.get("location")!).searchParams.get("state")!;
     const q: Record<string, string> = { code: "good-code", shop: SHOP, state, timestamp: String(Math.floor(Date.now() / 1000)) };
-    const cb = await fetch(`${base}/shopify/callback?${new URLSearchParams({ ...q, hmac: signQuery(q, "app-secret") })}`, { redirect: "manual" });
-    assert.equal(cb.headers.get("location"), `http://localhost:3000/business?view=shopify&shop=${SHOP}`);
+    const cb = await fetch(`${base}/shopify/callback?${new URLSearchParams({ ...q, hmac: signQuery(q, "app-secret") })}`, { redirect: "manual", headers: { cookie } });
+    assert.equal(cb.status, 200);
+    const pending = /name="pending" value="([^"]+)"/.exec(await cb.text())![1];
+    const form = { method: "POST", redirect: "manual" as const, body: new URLSearchParams({ pending, action: "link" }).toString() };
+    // A form posted from another site is refused before it is read.
+    const foreign = await fetch(`${base}/shopify/confirm`, {
+      ...form, headers: { cookie, "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example" },
+    });
+    assert.equal(foreign.status, 403);
+    const confirmed = await fetch(`${base}/shopify/confirm`, {
+      ...form, headers: { cookie, "content-type": "application/x-www-form-urlencoded", origin: "http://localhost:3100" },
+    });
+    assert.equal(confirmed.headers.get("location"), `https://zold.example/business?view=shopify&shop=${SHOP}`);
     assert.ok(store.findShopifyConnectionByShop(SHOP));
 
     const o = {

@@ -18,15 +18,17 @@
 import express from "express";
 import { describeCoreFailure, isCoreRefusal, coreCode, type ServiceView } from "./core-merchant.js";
 import { CORE_MAX_REQUEST_EUR, disableConnection, type ShopifyContext } from "./shopify-context.js";
-import { externalHttpUrl, normaliseShop, orderGidOf, sha256Hex, verifyBodyHmac } from "./shopify-hmac.js";
+import { cleanOrderName, normaliseShop, orderGidOf, sha256Hex, verifyBodyHmac } from "./shopify-hmac.js";
 import { store, type ShopifyConnection, type ShopifyOrder } from "./store.js";
 
 const DELIVERY_TTL_MS = 72 * 3_600_000;
 const MAX_DELIVERIES = 50_000;
 const MAX_DELIVERY_ID = 200;
+/** A cancel that arrived before its order: the order is not opened if it follows within this. */
+const TOMBSTONE_TTL_MS = 72 * 3_600_000;
+const MAX_TOMBSTONES = 50_000;
 /** An order with many line items is large; anything past this is not an order. */
 const BODY_LIMIT = "1mb";
-const MAX_ORDER_NAME = 40;
 const MAX_DESCRIPTION = 140;
 
 type Answer = { status: number; body: Record<string, unknown> };
@@ -38,6 +40,17 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
   const deliveries = new Map<string, { shop: string; at: number; handled: boolean }>();
   /** Requests being opened right now, by shop and order: a concurrent delivery waits for the first. */
   const opening = new Map<string, Promise<Answer>>();
+  /** Orders cancelled before we opened anything for them, by shop and order, until when. */
+  const tombstones = new Map<string, number>();
+
+  const tombstoned = (key: string, at: number) => (tombstones.get(key) ?? 0) > at;
+  const bury = (key: string, at: number) => {
+    for (const [k, until] of tombstones) {
+      if (until > at && tombstones.size < MAX_TOMBSTONES) break;
+      tombstones.delete(k);
+    }
+    tombstones.set(key, at + TOMBSTONE_TTL_MS);
+  };
 
   const prune = (at: number) => {
     for (const [id, d] of deliveries) {
@@ -70,7 +83,7 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
       } catch {
         return res.status(400).json({ error: "not JSON" });
       }
-      const answer = await handle(c, String(req.header("x-shopify-topic") ?? ""), body);
+      const answer = await handle(c, String(req.header("x-shopify-topic") ?? ""), body, req.header("x-shopify-triggered-at"));
       // Handled once answered without a server error; a failed one runs again on Shopify's retry.
       const d = deliveries.get(deliveryId);
       if (d && answer.status < 500) d.handled = true;
@@ -80,8 +93,11 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
     }
   });
 
-  async function handle(c: ShopifyConnection, topic: string, body: unknown): Promise<Answer> {
+  async function handle(c: ShopifyConnection, topic: string, body: unknown, triggeredAt: string | undefined): Promise<Answer> {
     if (topic === "app/uninstalled") {
+      // A late or replayed uninstall from before the current install must not undo it.
+      const triggered = Date.parse(triggeredAt ?? "");
+      if (Number.isFinite(triggered) && triggered < Date.parse(c.installedAt)) return ok({ ignored: "uninstall before this install" });
       await disableConnection(ctx, c, "app_uninstalled");
       return ok({ disabled: true });
     }
@@ -89,8 +105,8 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
     const o = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, any>) : {};
     const orderGid = orderGidOf(o.admin_graphql_api_id) ?? orderGidOf(o.id);
     if (!orderGid) return { status: 400, body: { error: "the order has no id" } };
-    if (topic === "orders/cancelled") return cancel(c, orderGid);
     const key = `${c.shop}|${orderGid}`;
+    if (topic === "orders/cancelled") return cancel(c, orderGid, key);
     const running = opening.get(key);
     if (running) return running;
     const p = create(c, orderGid, o).finally(() => opening.delete(key));
@@ -98,9 +114,13 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
     return p;
   }
 
-  async function cancel(c: ShopifyConnection, orderGid: string): Promise<Answer> {
+  async function cancel(c: ShopifyConnection, orderGid: string, key: string): Promise<Answer> {
     const row = store.findShopifyOrder(c.shop, orderGid);
-    if (!row) return ok({ cancelled: false });
+    if (!row) {
+      // Shopify does not promise order: an orders/create arriving after this opens nothing.
+      bury(key, ctx.now());
+      return ok({ cancelled: false });
+    }
     try {
       // Not cancellable (paid, or already CANCELLED or EXPIRED) comes back with
       // the view: a closed one is done, a paid one is the settle loop's.
@@ -120,6 +140,7 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
   /** Only a pending EUR order paid by the store's Zold method, for a sane amount, opens a request. */
   async function create(c: ShopifyConnection, orderGid: string, o: Record<string, any>): Promise<Answer> {
     if (store.findShopifyOrder(c.shop, orderGid)) return ok({ existing: true });
+    if (tombstoned(`${c.shop}|${orderGid}`, ctx.now())) return ok({ ignored: "cancelled" });
     if (c.disabledAt) return ok({ ignored: "connection disabled" });
     const gateways: string[] = Array.isArray(o.payment_gateway_names) ? o.payment_gateway_names.map((g: unknown) => String(g).toLowerCase()) : [];
     if (!gateways.some((g) => g.includes(ctx.manualGateway))) return ok({ ignored: "not a Zold order" });
@@ -133,15 +154,16 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
     const cents = Math.round(amount * 100);
     if (!(cents > 0) || cents > CORE_MAX_REQUEST_EUR * 100) return ok({ ignored: "amount" });
 
-    const name = typeof o.name === "string" && o.name.length <= MAX_ORDER_NAME ? o.name : undefined;
-    const statusUrl = externalHttpUrl(o.order_status_url);
+    const name = cleanOrderName(o.name);
+    // Nothing about the buyer goes to Zold. Not order_status_url either: it is a
+    // bearer link to the buyer's order page (name, address).
     let view: ServiceView;
     try {
       view = await ctx.core.openPaymentRequest(c.linkId, {
         amountEur: cents / 100,
         description: `Order ${name ?? ""} at ${c.shop}`.replace(/\s+/g, " ").slice(0, MAX_DESCRIPTION),
         ...(o.test === true ? { test: true } : {}),
-        order: { gid: orderGid, ...(name ? { name } : {}), ...(statusUrl ? { statusUrl } : {}) },
+        order: { gid: orderGid, ...(name ? { name } : {}) },
       });
     } catch (err) {
       return refused(c, orderGid, err);
@@ -160,6 +182,7 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
       code: view.code,
       publicPath: view.publicPath,
       pageUrl: view.pageUrl,
+      amountEur: cents / 100,
       ...(name ? { orderName: name } : {}),
       // Only its hash: the token is the buyer's proof on the thank-you page.
       ...(typeof o.checkout_token === "string" && o.checkout_token ? { checkoutTokenHash: sha256Hex(o.checkout_token) } : {}),
@@ -169,6 +192,8 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
       updatedAt: at,
     };
     store.addShopifyOrder(row);
+    // Cancelled while Zold was opening it: cancel it there too.
+    if (tombstoned(`${c.shop}|${orderGid}`, ctx.now())) return cancel(c, orderGid, `${c.shop}|${orderGid}`);
     return ok({ opened: true });
   }
 
@@ -182,9 +207,6 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
       await disableConnection(ctx, c, "link_revoked");
       return ok({ ignored: "link revoked" });
     }
-    // Opened already, under this store's earlier link: the row we hold keeps
-    // its original link id, through which it is still read, cancelled and settled.
-    if (code === "ORDER_TAKEN" && store.findShopifyOrder(c.shop, orderGid)) return ok({ existing: true });
     if (code === "NO_PAYMENT_PAGE") {
       // The payee recorded on the link can no longer be paid. Not retried: the
       // order stays unpaid in Shopify until the merchant links the store again.

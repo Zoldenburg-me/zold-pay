@@ -15,7 +15,6 @@ export interface ShopifyContext {
   publicOrigin: string;
   /** Zold's public origin: the merchant goes back to its /business after an install. */
   corePublicUrl: string;
-  allowInsecureLoopback: boolean;
   /** AES-256-GCM key for access tokens and link secrets at rest. */
   tokenKey: Buffer;
   admin: ShopifyAdmin;
@@ -33,8 +32,11 @@ export const sealAccessToken = (ctx: ShopifyContext, connectionId: string, token
   sealSecret(ctx.tokenKey, "shopify-access-token", connectionId, token);
 export const sealLinkSecret = (ctx: ShopifyContext, connectionId: string, secret: string) =>
   sealSecret(ctx.tokenKey, "shopify-link-secret", connectionId, secret);
-export const accessTokenOf = (ctx: ShopifyContext, c: ShopifyConnection) =>
-  openSecret(ctx.tokenKey, "shopify-access-token", c.id, c.accessTokenEnc);
+/** The store's access token. Throws when there is none (the app was uninstalled). */
+export function accessTokenOf(ctx: ShopifyContext, c: ShopifyConnection): string {
+  if (!c.accessTokenEnc) throw new Error("the store has no access token (the app was uninstalled)");
+  return openSecret(ctx.tokenKey, "shopify-access-token", c.id, c.accessTokenEnc);
+}
 export const linkSecretOf = (ctx: ShopifyContext, c: ShopifyConnection) =>
   openSecret(ctx.tokenKey, "shopify-link-secret", c.id, c.linkSecretEnc);
 
@@ -43,19 +45,25 @@ export const errorText = (err: unknown): string => (err instanceof Error ? err.m
 
 /**
  * Stop a connection opening payment requests. Requests already open stay open
- * (money that arrives still lands in the organisation's account) and the
- * settle loop may still mark their orders paid. For a revoked link the store's
- * webhook subscriptions are removed too, best effort; after an uninstall
- * Shopify has already removed them and the token no longer works.
+ * (money that arrives still lands in the organisation's account). For a
+ * revoked link the settle loop may still mark their orders paid, and the
+ * store's webhook subscriptions are removed, best effort. After an uninstall
+ * Shopify has removed them and the token no longer works, so the token is
+ * deleted and the store's orders count as closed here.
  */
 export async function disableConnection(ctx: ShopifyContext, c: ShopifyConnection, reason: ShopifyDisabledReason): Promise<void> {
   const fresh = store.findShopifyConnectionByShop(c.shop);
   if (!fresh || fresh.id !== c.id) return;
   if (fresh.disabledReason !== reason) {
-    store.updateShopifyConnection(fresh.id, { disabledAt: new Date(ctx.now()).toISOString(), disabledReason: reason });
+    store.updateShopifyConnection(fresh.id, {
+      disabledAt: new Date(ctx.now()).toISOString(),
+      disabledReason: reason,
+      ...(reason === "app_uninstalled" ? { accessTokenEnc: undefined, webhookSubscriptionIds: [] } : {}),
+    });
+    if (reason === "app_uninstalled") store.closeShopifyOrdersOf(fresh.shop);
     ctx.log(`SHOPIFY_DISABLED ${fresh.shop}: ${reason}`);
   }
-  if (reason !== "link_revoked" || !fresh.webhookSubscriptionIds.length) return;
+  if (reason !== "link_revoked" || !fresh.webhookSubscriptionIds.length || !fresh.accessTokenEnc) return;
   const left: string[] = [];
   for (const id of fresh.webhookSubscriptionIds) {
     try {

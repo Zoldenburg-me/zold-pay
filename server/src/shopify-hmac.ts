@@ -68,21 +68,18 @@ export function signQuery(query: Record<string, unknown>, secret: string): strin
   return createHmac("sha256", secret).update(message).digest("hex");
 }
 
+const MAX_ORDER_NAME = 40;
+
 /**
- * A merchant-supplied URL we may put in a redirect or an href, or nothing.
- * The HMAC proves a webhook came from Shopify; it does not make the strings in
- * it safe, and `javascript:` in an href is script on a stranger's page. https
- * only; anything else is dropped, not repaired.
+ * Shopify's order name ("#1001"), fit to store and to put in a log line:
+ * control characters removed (a newline would forge a log line), trimmed, at
+ * most 40 characters. Undefined when nothing is left.
  */
-export function externalHttpUrl(raw: unknown): string | undefined {
-  if (typeof raw !== "string" || !raw || raw.length > 2048) return undefined;
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    return undefined;
-  }
-  return u.protocol === "https:" ? u.toString() : undefined;
+export function cleanOrderName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  // eslint-disable-next-line no-control-regex
+  const name = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "").trim();
+  return name && name.length <= MAX_ORDER_NAME ? name : undefined;
 }
 
 /** `gid://shopify/Order/<digits>` from a numeric id or a gid, or undefined. */
