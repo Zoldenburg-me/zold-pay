@@ -788,8 +788,18 @@ describe("settlement", () => {
     assert.equal(facts.amountEur, 129);
     assert.equal(facts.code, row(o)!.code);
     assert.ok(facts.payments[0].txHash.startsWith("0x"));
-    assert.equal(row(o)!.checkoutTokenHash, undefined, "the buyer's proof outlived the order");
-    assert.equal((await call(`/shopify/orders/${SHOP}/${o.id}?t=${o.checkout_token}`)).status, 404);
+    // The thank-you block still shows "payment received" for the next 24 hours...
+    assert.equal(row(o)!.closedAt, new Date(clock).toISOString());
+    const right = await call(`/shopify/orders/${SHOP}/${o.id}?t=${o.checkout_token}`);
+    assert.equal(right.status, 200);
+    assert.equal(right.body.state, "PAID");
+    later(24 * 3_600_000);
+    assert.equal((await call(`/shopify/orders/${SHOP}/${o.id}?t=${o.checkout_token}`)).status, 200, "dropped before 24 hours");
+    // ...and gives the not-yet 404 once they have passed.
+    later(60_000);
+    const gone = await call(`/shopify/orders/${SHOP}/${o.id}?t=${o.checkout_token}`);
+    assert.equal(gone.status, 404);
+    assert.equal(gone.body.pending, true);
     later(7_200_000);
     await settle();
     assert.equal(marks(o.admin_graphql_api_id).length, 1, "marked twice");
@@ -897,7 +907,7 @@ describe("settlement", () => {
     later(7_200_000);
     await settle();
     assert.equal(row(o)!.state, "EXPIRED");
-    assert.equal(row(o)!.checkoutTokenHash, undefined, "the buyer's proof outlived the order");
+    assert.equal(row(o)!.closedAt, new Date(clock).toISOString());
     assert.equal(marks(o.admin_graphql_api_id).length, 0);
     assert.equal(store.shopifyOrdersAwaitingSettlement().some((x) => x.orderGid === o.admin_graphql_api_id), false);
   });
@@ -959,7 +969,7 @@ describe("settlement", () => {
     const c = store.findShopifyConnectionByShop(U)!;
     assert.equal(c.accessTokenEnc, undefined, "the revoked token is still kept");
     assert.deepEqual(c.webhookSubscriptionIds, []);
-    assert.equal(row(o, U)!.checkoutTokenHash, undefined);
+    assert.equal(row(o, U)!.closedAt, new Date(clock).toISOString());
     assert.equal(store.shopifyOrdersAwaitingSettlement().some((x) => x.shop === U), false);
     later(7_200_000);
     await settle();

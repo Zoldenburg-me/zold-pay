@@ -192,8 +192,9 @@ the buyer holds, and without it answers the same whether the order exists or not
   (`method`, `amountEur`, `amountUsdc`, `kind`, `at`; no transaction hash), plus
   the pay page URL and the order name. No payment code, return or cancel URL,
   bank details or names, and nothing Zold adds later. Without the token: the
-  same `404 {pending: true}` as an unknown order. Once the order is marked paid
-  or closed the token's hash is deleted, so the block then sees the same 404.
+  same `404 {pending: true}` as an unknown order. The token works for 24 hours
+  after the order is marked paid or closed (so the block shows "payment
+  received"); after that it gets the same 404.
 - `GET /shopify/orders/:shop/:orderId/pay?b=<proof>` is the email link. `b` must
   be HMAC-SHA256 of the numeric order id under the store's link secret (what
   Liquid's `hmac_sha256` renders), compared in constant time; then a 302 to the
@@ -219,8 +220,9 @@ neither kept nor passed on.
 - `shopifyOrders`, keyed by shop and order gid: the request's id, handle, payment
   code, public path and pay page URL, the amount, the order name, the SHA-256 of
   the checkout token, Zold's last state and the mark-paid record. The checkout
-  token's hash is deleted as soon as the order is marked paid or closed. An order
-  that is marked paid or closed is deleted 90 days after its last change.
+  token's hash is deleted 24 hours after the order is marked paid or closed
+  (`closedAt`). An order that is marked paid or closed is deleted 90 days after
+  its last change.
 - A file written before these lists gets them empty on load.
 
 **In memory only:** delivery ids (72 hours), started installs and confirmation
@@ -235,7 +237,8 @@ lookup.
 
 **On app/uninstalled:** the access token is deleted (Shopify revoked it), the
 webhook subscription ids are cleared, the store's orders count as closed (out
-of settlement, checkout-token hashes deleted) and are deleted 90 days later.
+of settlement, checkout-token hashes deleted 24 hours later) and are deleted 90
+days later.
 Requests already open at Zold stay open there; money that arrives still lands
 in the organisation's account.
 

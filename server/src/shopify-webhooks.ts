@@ -125,7 +125,7 @@ export function createShopifyWebhookRouter(ctx: ShopifyContext): express.Router 
       // Not cancellable (paid, or already CANCELLED or EXPIRED) comes back with
       // the view: a closed one is done, a paid one is the settle loop's.
       const { view } = await ctx.core.cancelPaymentRequest(row.linkId, row.paymentRequestId);
-      store.updateShopifyOrder(row.shop, row.orderGid, { state: view.state });
+      store.updateShopifyOrder(row.shop, row.orderGid, { state: view.state }, ctx.now());
       return ok({ cancelled: view.state === "CANCELLED", state: view.state });
     } catch (err) {
       if (!isCoreRefusal(err)) {

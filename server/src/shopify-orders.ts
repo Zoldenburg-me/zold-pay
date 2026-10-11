@@ -15,7 +15,7 @@ import express from "express";
 import { describeCoreFailure, isCoreError, isCoreOutage } from "./core-merchant.js";
 import { linkSecretOf, type ShopifyContext } from "./shopify-context.js";
 import { isValidShopDomain, normaliseShop, numericOrderId, orderGidOf, orderLinkProof, sameHex, sha256Hex } from "./shopify-hmac.js";
-import { store, type ShopifyOrder } from "./store.js";
+import { shopifyBuyerProofLive, store, type ShopifyOrder } from "./store.js";
 
 type Json = Record<string, unknown>;
 const isObject = (v: unknown): v is Json => Boolean(v) && typeof v === "object" && !Array.isArray(v);
@@ -89,7 +89,9 @@ export function createShopifyOrdersRouter(ctx: ShopifyContext): express.Router {
     try {
       const order = orderRef(req.params.shop, req.params.orderId)?.order;
       const t = typeof req.query.t === "string" && req.query.t.length <= MAX_PROOF ? req.query.t : "";
-      const proven = Boolean(order?.checkoutTokenHash && t && sameHex(sha256Hex(t), order.checkoutTokenHash));
+      const proven = Boolean(
+        order?.checkoutTokenHash && shopifyBuyerProofLive(order, ctx.now()) && t && sameHex(sha256Hex(t), order.checkoutTokenHash),
+      );
       if (!order || !proven) return res.status(404).json(NOT_YET);
       let projection: Record<string, unknown>;
       try {

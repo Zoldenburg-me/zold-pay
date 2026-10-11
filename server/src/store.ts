@@ -189,8 +189,10 @@ export interface ShopifyOrder {
   amountEur: number;
   /** Shopify's order name, control characters removed. */
   orderName?: string;
-  /** SHA-256 of the order's checkout token, the thank-you page's proof. Dropped once the order is closed or marked paid. */
+  /** SHA-256 of the order's checkout token, the thank-you page's proof. Kept 24 hours past `closedAt`. */
   checkoutTokenHash?: string;
+  /** When the order was marked paid or closed here (request closed, store uninstalled). */
+  closedAt?: string;
   /** Zold's effective state of the request when last read (OPEN, PAID, CANCELLED, EXPIRED...). */
   state: string;
   /** When Shopify accepted "Mark as paid" for the order. */
@@ -208,6 +210,18 @@ export const SHOPIFY_CLOSED_STATES: ReadonlySet<string> = new Set(["CANCELLED", 
 
 /** How long a settled or closed Shopify order is kept, counted from its last change. */
 export const SHOPIFY_ORDER_RETENTION_MS = 90 * 24 * 60 * 60_000;
+
+/**
+ * How long the buyer's proof outlives the order's close: the thank-you page
+ * must still show "payment received" after the order is marked paid.
+ */
+export const SHOPIFY_BUYER_PROOF_TTL_MS = 24 * 60 * 60_000;
+
+/** Does this order still carry a buyer proof that may be used at `now`? */
+export function shopifyBuyerProofLive(o: ShopifyOrder, now: number): boolean {
+  if (!o.checkoutTokenHash) return false;
+  return !o.closedAt || !(now - Date.parse(o.closedAt) > SHOPIFY_BUYER_PROOF_TTL_MS);
+}
 
 /**
  * Nothing more will happen to this order here: marked paid, its request closed
@@ -416,10 +430,18 @@ export const store = {
     const purged = purgeStalePayerNames(kept, now);
     // A Shopify order is kept while Zold may still be paid for it and the store
     // can be told; once closed, for 90 days after its last change.
-    const orders = db.shopifyOrders.filter(
-      (o) => !(shopifyOrderClosed(o, db.shopifyConnections) && now - Date.parse(o.updatedAt) > SHOPIFY_ORDER_RETENTION_MS),
-    );
-    if (kept.length !== db.paymentIntents.length || purged.changed || orders.length !== db.shopifyOrders.length) {
+    // A buyer proof is dropped 24 hours after its order closed (without
+    // counting as a change to the order).
+    let proofsDropped = 0;
+    const orders = db.shopifyOrders
+      .filter((o) => !(shopifyOrderClosed(o, db.shopifyConnections) && now - Date.parse(o.updatedAt) > SHOPIFY_ORDER_RETENTION_MS))
+      .map((o) => {
+        if (!o.checkoutTokenHash || shopifyBuyerProofLive(o, now)) return o;
+        proofsDropped++;
+        return withoutKeys(o, "checkoutTokenHash");
+      });
+    const ordersChanged = orders.length !== db.shopifyOrders.length || proofsDropped > 0;
+    if (kept.length !== db.paymentIntents.length || purged.changed || ordersChanged) {
       commit({ ...db, paymentIntents: purged.intents, shopifyOrders: orders });
     }
   },
@@ -495,24 +517,25 @@ export const store = {
     commit({ ...db, shopifyOrders: [...db.shopifyOrders, o] });
     return o;
   },
-  updateShopifyOrder(shop: string, orderGid: string, patch: Partial<ShopifyOrder>) {
+  /** `at` is the caller's clock, used as `closedAt` when this change closes the order. */
+  updateShopifyOrder(shop: string, orderGid: string, patch: Partial<ShopifyOrder>, at: number = Date.now()) {
     const old = store.findShopifyOrder(shop, orderGid);
     if (!old) throw new Error("shopify order not found");
     let updated = patched(old, patch);
-    // The buyer's proof is needed only while the order can still be paid.
-    if (updated.checkoutTokenHash && (updated.markedPaidAt || SHOPIFY_CLOSED_STATES.has(updated.state))) {
-      updated = withoutKeys(updated, "checkoutTokenHash");
+    // The moment it closes starts the buyer proof's last 24 hours (see sweep).
+    if (!updated.closedAt && (updated.markedPaidAt || SHOPIFY_CLOSED_STATES.has(updated.state))) {
+      updated = { ...updated, closedAt: new Date(at).toISOString() };
     }
     commit({ ...db, shopifyOrders: db.shopifyOrders.map((x) => (x === old ? updated : x)) });
     return updated;
   },
   /**
    * A store uninstalled the app: its orders are closed here. Their buyers'
-   * proofs are dropped and their 90 days start now.
+   * proofs have 24 hours left and their 90 days start now.
    */
-  closeShopifyOrdersOf(shop: string) {
-    const at = new Date().toISOString();
-    const next = db.shopifyOrders.map((o) => (o.shop === shop ? { ...withoutKeys(o, "checkoutTokenHash"), updatedAt: at } : o));
+  closeShopifyOrdersOf(shop: string, now: number = Date.now()) {
+    const at = new Date(now).toISOString();
+    const next = db.shopifyOrders.map((o) => (o.shop === shop ? { ...o, closedAt: o.closedAt ?? at, updatedAt: at } : o));
     commit({ ...db, shopifyOrders: next });
   },
   /** Orders whose request can still be paid, or was paid and the store has not been told. */
