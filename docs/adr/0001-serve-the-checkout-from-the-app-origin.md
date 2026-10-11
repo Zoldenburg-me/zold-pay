@@ -22,8 +22,8 @@ Zold's spending authority is origin-bound in a way ordinary web auth is not:
   registrable domain can share it (`rp.id = zold.app`), so passkeys survive the
   split.
 - The **FP4 device key** does not. It is an EOA generated in the browser, held
-  in **one origin's `localStorage`**, and registered **on-chain** as the
-  account's `authorizer`. `RemitVault.debit` refuses any debit not signed by it.
+  in **one origin's `localStorage`**, and registered with the core as the
+  account's `authorizer`. The core refuses a payment without its signature.
   A second origin has a different `localStorage`, so the key is simply absent —
   and because only the *current* authorizer may rotate the binding, the new
   origin cannot mint a replacement either.
@@ -90,7 +90,7 @@ fork: instead of asking "new or existing", offer a passkey prompt with
 everyone else falls through to onboarding without ever seeing a choice. One
 entry point, two outcomes.
 
-### Stage 2 — passkey as the spending authority (FP4, second half)
+### Stage 2 — passkey as the spending authority
 
 Stage 1 leaves a hard edge: a passkey **syncs across devices**, the device key
 **does not**. An existing user paying from a new laptop authenticates fine and
@@ -98,51 +98,24 @@ then cannot sign, and cannot re-bind, because only the current authorizer may
 rotate. Same wall as a lost key, reached by an ordinary user doing an ordinary
 thing.
 
-The fix is already planned in the core's CLAUDE.md, and the order is not
-optional:
+Where the core stands: the passkey is the Safe's **only** owner (threshold 1)
+and approves every debit as a user operation; the Monerium redeem is approved
+with a passkey assertion at send time too. The core holds no key on the Safe
+and refuses to add a co-owner Zold holds. Recovery is a guardian module the
+user opts into.
 
-1. Passkey becomes a Safe owner (`fromSafeWebauthn`), replacing the server-held
-   `user.privateKey`.
-2. Add the co-signer as a second owner, threshold 2. The server can never act
-   alone.
-3. `setAuthorizer(safe, safe)`. `RemitVault._isValidSignature` already
-   staticcalls `isValidSignature` for contract signers, so **no contract
-   change**. RIP-7212 is live on Base Sepolia and mainnet, so no verifier
-   contract either.
-4. Install `SocialRecoveryModule` with guardians. With 2-of-2 there is no spare
-   signer, so guardians are required, not optional.
-5. Delete `user.privateKey`.
+What is left for this stage: the core still asks for the **device key's**
+signature over the transfer terms next to the two passkey assertions. Dropping
+that requirement, so that the passkey alone authorizes a payment, removes the
+per-browser state: the "pay from that device" refusal disappears and origin
+stops mattering for payments. That is a core change, not a checkout change.
 
-Steps 1–2 must precede 3: pointing `authorizerOf` at the Safe while the server
-still owns it would hand the database spending power over every balance.
-
-For this checkout the effect is the whole point: **spending authority follows
-the passkey, which syncs.** The device key stops being per-browser state, the
-"pay from that device" refusal disappears, and origin ceases to matter for
-payments at all. Stage 1's benefit is subsumed — but Stage 1 is a config change
-available now, and Stage 2 is a multi-week custody change, so do both.
-
-Design in from the start: `redeemToIban` signs as the Safe to burn EURe and runs
-**after the user has gone**. A passkey-owned Safe cannot be signed by the server
-alone, so collect the vault authorization *and* the Monerium redeem signature at
-approval time. Both are fully determined by amount + IBAN, so nothing is signed
-blind.
-
-Hard edge that remains: only the current authorizer can rotate, so accounts that
-still hold their device key can migrate themselves and ones that lost it never
-can. This fixes the future, not the past.
-
-### Stage 3 — the parts architecture cannot fix
+### Stage 3 — the part architecture cannot fix
 
 - **Funding.** A brand-new account has €0 and no instant rail. Neither stage
   above changes that. It is why Stage 1 matters commercially: it makes the
   *existing-user* flow — the one with no funding step — the default path
   through the checkout.
-- **Merchant settlement visibility.** An intent's status is captured at attach
-  and never advances, because reading a transfer needs the user's session and
-  the merchant polls after the user has gone. Needs a core-side checkout
-  webhook, or a service credential that can read a transfer without a user
-  session. Invisible locally: hardhat settles to `PAID` before attach.
 
 ## Alternatives considered
 
@@ -154,8 +127,8 @@ handoff back needs its own state-passing. All of that to preserve a hostname.
 **Keep two origins; accept new-users-only.** What is built today. Concedes the
 better half of the product to preserve a cosmetic separation.
 
-**Merge back into the core repo.** Would also fix the duplicated merchant store
-and the status-freeze, since the checkout could read transfers directly. But it
+**Merge back into the core repo.** Would also remove the duplicated merchant store
+and the service credential, since the checkout could read transfers directly. But it
 reverses PR #68 for reasons unrelated to why PR #68 was made, and the blast-
 radius argument for a separate merchant-facing surface is real. Path routing
 gets the origin benefit without the reversal.
