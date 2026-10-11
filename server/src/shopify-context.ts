@@ -60,7 +60,7 @@ export async function disableConnection(ctx: ShopifyContext, c: ShopifyConnectio
       disabledReason: reason,
       ...(reason === "app_uninstalled" ? { accessTokenEnc: undefined, webhookSubscriptionIds: [] } : {}),
     });
-    if (reason === "app_uninstalled") store.closeShopifyOrdersOf(fresh.shop);
+    if (reason === "app_uninstalled") store.closeShopifyOrdersOf(fresh.shop, ctx.now());
     ctx.log(`SHOPIFY_DISABLED ${fresh.shop}: ${reason}`);
   }
   if (reason !== "link_revoked" || !fresh.webhookSubscriptionIds.length || !fresh.accessTokenEnc) return;

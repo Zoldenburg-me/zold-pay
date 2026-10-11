@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 
 const { hashSecret } = await import("../server/src/secrets.js");
-const { INTENT_TTL_MS, initStore, store } = await import("../server/src/store.js");
+const { INTENT_TTL_MS, initStore, shopifyBuyerProofLive, store } = await import("../server/src/store.js");
 
 const tmpDb = () => path.join(mkdtempSync(path.join(tmpdir(), "pay-store-")), "checkout.json");
 const NOW = "2026-10-09T10:00:00.000Z";
@@ -276,16 +276,30 @@ describe("Shopify rows", () => {
     assert.deepEqual(left, ["3", "4", "5"]);
   });
 
-  it("drops the buyer's proof once an order is closed or marked paid", () => {
-    initStore(tmpDb());
+  it("keeps the buyer's proof for 24 hours after an order closes or is marked paid, then the sweep drops it", () => {
+    const file = tmpDb();
+    initStore(file);
     store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/1", checkoutTokenHash: "a".repeat(64) }));
     store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/2", checkoutTokenHash: "b".repeat(64) }));
-    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/1", { state: "PAID" });
-    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1")!.checkoutTokenHash, "a".repeat(64), "dropped while still unmarked");
-    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/1", { markedPaidAt: NOW });
-    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/2", { state: "CANCELLED" });
-    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1")!.checkoutTokenHash, undefined);
-    assert.equal(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/2")!.checkoutTokenHash, undefined);
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/3", checkoutTokenHash: "c".repeat(64) }));
+    const get = (n: number) => store.findShopifyOrder("a.myshopify.com", `gid://shopify/Order/${n}`)!;
+    const t0 = Date.now();
+    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/1", { state: "PAID" }, t0);
+    assert.equal(get(1).closedAt, undefined, "closed while still unmarked");
+    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/1", { markedPaidAt: new Date(t0).toISOString() }, t0);
+    store.updateShopifyOrder("a.myshopify.com", "gid://shopify/Order/2", { state: "CANCELLED" }, t0);
+    assert.equal(get(1).closedAt, new Date(t0).toISOString());
+    assert.equal(shopifyBuyerProofLive(get(1), t0 + 24 * 3_600_000), true);
+    assert.equal(shopifyBuyerProofLive(get(1), t0 + 24 * 3_600_000 + 1), false);
+    store.sweep(t0 + 23 * 3_600_000);
+    assert.equal(get(1).checkoutTokenHash, "a".repeat(64));
+    const updatedAt = get(2).updatedAt;
+    store.sweep(t0 + 25 * 3_600_000);
+    assert.equal(get(1).checkoutTokenHash, undefined);
+    assert.equal(get(2).checkoutTokenHash, undefined);
+    assert.equal(get(2).updatedAt, updatedAt, "dropping the proof counted as a change");
+    assert.equal(get(3).checkoutTokenHash, "c".repeat(64), "an open order's proof was dropped");
+    assert.equal(readFileSync(file, "utf8").includes("a".repeat(64)), false);
   });
 
   it("an uninstalled store's orders are closed: out of settlement, proofs dropped, swept 90 days after the uninstall", () => {
@@ -300,7 +314,8 @@ describe("Shopify rows", () => {
     store.closeShopifyOrdersOf("a.myshopify.com");
     assert.deepEqual(store.shopifyOrdersAwaitingSettlement().map((o) => o.shop), ["b.myshopify.com"]);
     const closed = store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1")!;
-    assert.equal(closed.checkoutTokenHash, undefined);
+    assert.ok(closed.closedAt);
+    assert.equal(shopifyBuyerProofLive(closed, Date.parse(closed.closedAt!) + 25 * 3_600_000), false);
     store.sweep();
     assert.ok(store.findShopifyOrder("a.myshopify.com", "gid://shopify/Order/1"), "swept before its 90 days");
     // 91 days on, as written to disk.

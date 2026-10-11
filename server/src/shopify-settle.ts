@@ -99,7 +99,7 @@ export function createShopifySettler(ctx: ShopifyContext, opts: ShopifySettlerOp
       markPaidAttempts: attempts,
       lastError: undefined,
       nextAttemptAt: undefined,
-    });
+    }, now);
     log(alreadyPaid ? `shopify: order ${label(row)} was already marked paid in Shopify` : `shopify: marked order ${label(row)} paid`);
     try {
       await ctx.admin.orderSetPaymentMetafield(row.shop, token, row.orderGid, {
@@ -136,7 +136,7 @@ export function createShopifySettler(ctx: ShopifyContext, opts: ShopifySettlerOp
     }
     const fresh = store.findShopifyOrder(row.shop, row.orderGid);
     if (!fresh || fresh.markedPaidAt) return "closed";
-    if (fresh.state !== view.state) store.updateShopifyOrder(row.shop, row.orderGid, { state: view.state });
+    if (fresh.state !== view.state) store.updateShopifyOrder(row.shop, row.orderGid, { state: view.state }, now);
     if (view.state === "PAID") {
       if (toCents(view.amountEur) !== toCents(fresh.amountEur)) {
         // Never mark an order paid for a request of another amount.
