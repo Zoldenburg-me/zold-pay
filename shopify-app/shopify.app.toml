@@ -1,0 +1,41 @@
+# Zold — Shopify app project (custom-app mode).
+#
+# This folder is ONLY Shopify's configuration and the checkout UI extension.
+# The app's backend is the Zold Checkout service in ../server (shopify*.ts);
+# there is no server here. Run `shopify app dev` / `shopify app deploy` from this
+# folder with the Shopify CLI (npm i -g @shopify/cli) after `shopify app config
+# link` has attached it to the app created in the Partner Dashboard.
+#
+# Distribution: CUSTOM (one store, no Shopify review). Set that in the Partner
+# Dashboard under Distribution before the first deploy.
+
+client_id = "REPLACE_WITH_PARTNER_DASHBOARD_CLIENT_ID"
+name = "Zold"
+handle = "zold"
+application_url = "https://REPLACE_WITH_ZOLD_ORIGIN/business"
+embedded = false
+
+[build]
+automatically_update_urls_on_dev = false
+include_config_on_deploy = true
+
+[access_scopes]
+# Orders in, Mark as paid out. No payment-gateway scopes: those need the
+# Payments Apps program.
+scopes = "read_orders,write_orders"
+
+[auth]
+redirect_urls = ["https://REPLACE_WITH_CHECKOUT_ORIGIN/shopify/callback"]
+
+# Webhooks are subscribed by the Zold Checkout service at install
+# (shopify-install.ts), so they follow whatever origin it runs on. Declaring
+# them here as well is harmless (shop + order gid is the idempotency key) but
+# not needed.
+# [webhooks]
+# api_version = "2026-07"
+# [[webhooks.subscriptions]]
+# topics = ["orders/create", "orders/cancelled", "app/uninstalled"]
+# uri = "https://REPLACE_WITH_CHECKOUT_ORIGIN/shopify/webhooks"
+
+[webhooks]
+api_version = "2026-07"

@@ -143,15 +143,77 @@ export interface PaymentIntent {
   updatedAt: string;
 }
 
+/** Why a store's connection stopped opening payment requests. */
+export type ShopifyDisabledReason = "app_uninstalled" | "link_revoked";
+
+/**
+ * One Shopify store connected through a Zold merchant link (one row per shop).
+ * The access token and the pay-link secret are sealed (secrets.ts), bound to
+ * this row's id; neither is ever logged or sent to a browser.
+ */
+export interface ShopifyConnection {
+  id: string;
+  /** myshopify.com domain, lower-case. */
+  shop: string;
+  /** The Zold merchant link this store opens payment requests under. */
+  linkId: string;
+  accessTokenEnc: string;
+  linkSecretEnc: string;
+  scope: string;
+  installedAt: string;
+  updatedAt: string;
+  /** Admin API ids of our webhook subscriptions, so a revoked link can remove them. */
+  webhookSubscriptionIds: string[];
+  disabledAt?: string;
+  disabledReason?: ShopifyDisabledReason;
+}
+
+/**
+ * A Shopify order with a Zold payment request, keyed by (shop, orderGid): order
+ * ids are per-store sequences, so the gid alone names a different order at
+ * every store.
+ */
+export interface ShopifyOrder {
+  shop: string;
+  orderGid: string;
+  linkId: string;
+  paymentRequestId: string;
+  handle: string;
+  /** The request's payment code (display form). A credential: never logged. */
+  code: string;
+  /** Zold's public projection of the request, `/api/pay/<handle>/<code>`. */
+  publicPath: string;
+  pageUrl: string;
+  orderName?: string;
+  /** SHA-256 of the order's checkout token, the thank-you page's proof. */
+  checkoutTokenHash?: string;
+  /** Zold's effective state of the request when last read (OPEN, PAID, CANCELLED, EXPIRED...). */
+  state: string;
+  /** When Shopify accepted "Mark as paid" for the order. */
+  markedPaidAt?: string;
+  markPaidAttempts: number;
+  lastError?: string;
+  /** After a refused "Mark as paid": not tried again before this. */
+  nextAttemptAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Zold states after which nothing more can happen to an unpaid order's request. */
+export const SHOPIFY_CLOSED_STATES: ReadonlySet<string> = new Set(["CANCELLED", "EXPIRED"]);
+
 interface Db {
   merchants: Merchant[];
   paymentIntents: PaymentIntent[];
+  shopifyConnections: ShopifyConnection[];
+  shopifyOrders: ShopifyOrder[];
 }
 
 const DEFAULT_DB_PATH = process.env.CHECKOUT_DB_PATH ?? path.join(ROOT, "data/checkout.json");
 
 let dbPath = DEFAULT_DB_PATH;
-let db: Db = { merchants: [], paymentIntents: [] };
+const emptyDb = (): Db => ({ merchants: [], paymentIntents: [], shopifyConnections: [], shopifyOrders: [] });
+let db: Db = emptyDb();
 
 const withoutKeys = <T extends object>(o: T, ...keys: string[]): T => {
   const copy = { ...o } as Record<string, unknown>;
@@ -201,7 +263,12 @@ function migrate(raw: any): { db: Db; changed: boolean } {
     return out;
   });
 
-  return { db: { merchants, paymentIntents }, changed };
+  // Files written before the Shopify adapter have neither list.
+  const shopifyConnections: ShopifyConnection[] = Array.isArray(raw.shopifyConnections) ? raw.shopifyConnections : [];
+  const shopifyOrders: ShopifyOrder[] = Array.isArray(raw.shopifyOrders) ? raw.shopifyOrders : [];
+  if (!Array.isArray(raw.shopifyConnections) || !Array.isArray(raw.shopifyOrders)) changed = true;
+
+  return { db: { merchants, paymentIntents, shopifyConnections, shopifyOrders }, changed };
 }
 
 /** Drop payer names whose code is gone or expired. Pure: returns new records and whether any changed. */
@@ -219,7 +286,7 @@ function purgeStalePayerNames(intents: readonly PaymentIntent[], now = Date.now(
 
 export function initStore(file: string = DEFAULT_DB_PATH): void {
   dbPath = file;
-  db = { merchants: [], paymentIntents: [] };
+  db = emptyDb();
   if (!existsSync(dbPath)) return;
   let raw: any;
   try {
@@ -229,7 +296,7 @@ export function initStore(file: string = DEFAULT_DB_PATH): void {
   }
   const migrated = migrate(raw);
   const purged = purgeStalePayerNames(migrated.db.paymentIntents);
-  const loaded: Db = { merchants: migrated.db.merchants, paymentIntents: purged.intents };
+  const loaded: Db = { ...migrated.db, paymentIntents: purged.intents };
   if (migrated.changed || purged.changed) commit(loaded);
   else db = loaded;
 }
@@ -331,8 +398,13 @@ export const store = {
       return !(DEAD_STATUSES.has(i.status) && olderThan(DEAD_INTENT_MAX_AGE_MS));
     });
     const purged = purgeStalePayerNames(kept, now);
-    if (kept.length !== db.paymentIntents.length || purged.changed) {
-      commit({ ...db, paymentIntents: purged.intents });
+    // A Shopify order is kept while Zold may still be paid for it or the store
+    // not yet told; once it is settled either way, as long as a checkout.
+    const orders = db.shopifyOrders.filter(
+      (o) => !((o.markedPaidAt || SHOPIFY_CLOSED_STATES.has(o.state)) && now - Date.parse(o.createdAt) > SETTLED_INTENT_MAX_AGE_MS),
+    );
+    if (kept.length !== db.paymentIntents.length || purged.changed || orders.length !== db.shopifyOrders.length) {
+      commit({ ...db, paymentIntents: purged.intents, shopifyOrders: orders });
     }
   },
   /**
@@ -376,4 +448,51 @@ export const store = {
     commit({ ...db, paymentIntents: db.paymentIntents.map((x) => (x.id === id ? updated : x)) });
     return updated;
   },
+
+  // --- Shopify ---------------------------------------------------------------
+
+  findShopifyConnectionByShop: (shop: string) => db.shopifyConnections.find((c) => c.shop === shop),
+  findShopifyConnectionsByLink: (linkId: string) => db.shopifyConnections.filter((c) => c.linkId === linkId),
+  /** Add the shop's connection, or replace the one row the shop already has. */
+  saveShopifyConnection(c: ShopifyConnection) {
+    const others = db.shopifyConnections.filter((x) => x.shop !== c.shop);
+    commit({ ...db, shopifyConnections: [...others, c] });
+    return c;
+  },
+  updateShopifyConnection(id: string, patch: Partial<ShopifyConnection>) {
+    const old = db.shopifyConnections.find((x) => x.id === id);
+    if (!old) throw new Error("shopify connection not found");
+    const updated = patched(old, patch);
+    commit({ ...db, shopifyConnections: db.shopifyConnections.map((x) => (x.id === id ? updated : x)) });
+    return updated;
+  },
+
+  /** Always by shop and order: an order gid alone is not unique across stores. */
+  findShopifyOrder: (shop: string, orderGid: string) =>
+    db.shopifyOrders.find((o) => o.shop === shop && o.orderGid === orderGid),
+  findShopifyOrderByRequest: (linkId: string, paymentRequestId: string) =>
+    db.shopifyOrders.find((o) => o.linkId === linkId && o.paymentRequestId === paymentRequestId),
+  /** The existing row for (shop, orderGid) if there is one; otherwise adds this one. */
+  addShopifyOrder(o: ShopifyOrder) {
+    const existing = store.findShopifyOrder(o.shop, o.orderGid);
+    if (existing) return existing;
+    commit({ ...db, shopifyOrders: [...db.shopifyOrders, o] });
+    return o;
+  },
+  updateShopifyOrder(shop: string, orderGid: string, patch: Partial<ShopifyOrder>) {
+    const old = store.findShopifyOrder(shop, orderGid);
+    if (!old) throw new Error("shopify order not found");
+    const updated = patched(old, patch);
+    commit({ ...db, shopifyOrders: db.shopifyOrders.map((x) => (x === old ? updated : x)) });
+    return updated;
+  },
+  /** Orders whose request can still be paid, or was paid and the store has not been told. */
+  shopifyOrdersAwaitingSettlement: () =>
+    db.shopifyOrders.filter((o) => !o.markedPaidAt && !SHOPIFY_CLOSED_STATES.has(o.state)),
 };
+
+/** A new record with `patch` applied; `undefined` deletes the key. */
+function patched<T extends { updatedAt: string }>(old: T, patch: Partial<T>): T {
+  const cleared = Object.entries(patch).filter(([, v]) => v === undefined).map(([k]) => k);
+  return { ...withoutKeys({ ...old, ...patch }, ...cleared), updatedAt: new Date().toISOString() };
+}

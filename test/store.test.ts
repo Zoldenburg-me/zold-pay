@@ -59,6 +59,18 @@ describe("store migration", () => {
     assert.equal(readFileSync(file, "utf8").includes("Grace Hopper"), false);
   });
 
+  it("adds empty Shopify lists to a file written before them, keeping everything else", () => {
+    const file = tmpDb();
+    writeFileSync(file, JSON.stringify(legacy()));
+    initStore(file);
+    const onDisk = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual(onDisk.shopifyConnections, []);
+    assert.deepEqual(onDisk.shopifyOrders, []);
+    assert.equal(onDisk.merchants.length, 1);
+    assert.equal(onDisk.paymentIntents.length, 2);
+    assert.deepEqual(store.shopifyOrdersAwaitingSettlement(), []);
+  });
+
   it("is idempotent", () => {
     const file = tmpDb();
     writeFileSync(file, JSON.stringify(legacy()));
@@ -222,5 +234,44 @@ describe("durability when the disk write fails", () => {
     assert.equal(logged.length, 1);
     assert.match(String(logged[0][0]), /sweep failed/);
     assert.equal(store.sweepSafely(() => assert.fail("nothing to report")), true);
+  });
+});
+
+describe("Shopify rows", () => {
+  const conn = (over: Record<string, unknown> = {}) => ({
+    id: "c1", shop: "a.myshopify.com", linkId: "l1", accessTokenEnc: "v1.x", linkSecretEnc: "v1.y", scope: "read_orders",
+    installedAt: NOW, updatedAt: NOW, webhookSubscriptionIds: [], ...over,
+  });
+  const order = (over: Record<string, unknown> = {}) => ({
+    shop: "a.myshopify.com", orderGid: "gid://shopify/Order/1", linkId: "l1", paymentRequestId: "pr1", handle: "h",
+    code: "ABCDE-FGHIJ-KLMNO", publicPath: "/api/pay/h/ABCDE-FGHIJ-KLMNO", pageUrl: "https://z.example/pay/h/ABCDE-FGHIJ-KLMNO",
+    state: "OPEN", markPaidAttempts: 0, createdAt: NOW, updatedAt: NOW, ...over,
+  });
+
+  it("keeps one connection per shop and finds orders only with their shop", () => {
+    initStore(tmpDb());
+    store.saveShopifyConnection(conn());
+    store.saveShopifyConnection(conn({ linkId: "l2" }));
+    assert.equal(store.findShopifyConnectionsByLink("l2").length, 1);
+    assert.equal(store.findShopifyConnectionsByLink("l1").length, 0);
+    store.addShopifyOrder(order());
+    store.addShopifyOrder(order({ shop: "b.myshopify.com", paymentRequestId: "pr2" }));
+    assert.equal(store.addShopifyOrder(order({ paymentRequestId: "dup" })).paymentRequestId, "pr1", "a second row for one (shop, order)");
+    assert.equal(store.findShopifyOrder("b.myshopify.com", "gid://shopify/Order/1")?.paymentRequestId, "pr2");
+    assert.equal(store.findShopifyOrderByRequest("l1", "pr2")?.shop, "b.myshopify.com");
+    assert.throws(() => store.updateShopifyOrder("c.myshopify.com", "gid://shopify/Order/1", { state: "PAID" }), /not found/);
+    assert.throws(() => store.updateShopifyConnection("nope", { scope: "" }), /not found/);
+  });
+
+  it("sweeps settled Shopify orders after 90 days and keeps open or unmarked paid ones", () => {
+    initStore(tmpDb());
+    const old = "2020-01-01T00:00:00.000Z";
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/1", state: "PAID", markedPaidAt: old, createdAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/2", state: "EXPIRED", createdAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/3", state: "PAID", createdAt: old }));
+    store.addShopifyOrder(order({ orderGid: "gid://shopify/Order/4", state: "OPEN", createdAt: old }));
+    store.sweep();
+    const left = ["1", "2", "3", "4"].filter((n) => store.findShopifyOrder("a.myshopify.com", `gid://shopify/Order/${n}`));
+    assert.deepEqual(left, ["3", "4"]);
   });
 });
