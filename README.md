@@ -16,6 +16,7 @@ core Zold app and API live in `Zoldenburg-me/Zold-app` ("core" below).
 | **Verified** | The offline suite (`npm run check`, 80% coverage gate) and the wiring against a running local core (`npm run harness:smoke`) |
 | **Never run** | A WebAuthn ceremony in a real browser on this branch and a real SEPA payment ([BROWSER-CHECKLIST.md](BROWSER-CHECKLIST.md)). The service is not deployed anywhere |
 | **Not built** | Merchant onboarding (merchants are rows in `data/checkout.json`), new-user signup inside the checkout |
+| **Shopify adapter** | Built and tested against stubs of Shopify and Zold, off unless configured; no Shopify app registered, no store installed, the extension never built ([docs/shopify.md](docs/shopify.md)) |
 
 The payer must already be a Zold user with a connected Monerium account and
 enough euros. Creating an account, the passkey, the Safe and the Monerium
@@ -333,7 +334,17 @@ change any of these in the core, this is the list.
 | `POST /api/transfers/:id/authorize` | `{signature, executionAssertion?, moneriumRedeemAssertion?}`. The execution assertion is required when the transfer prepared a Safe execution. |
 | `GET /api/transfers/:id` | Session-scoped. Attach reads with the **payer's own bearer**; it must stay session-scoped rather than become public. |
 | `GET /api/service/checkout/transfers/:id` | With `ZOLD_SERVICE_TOKEN`: `{id, state, rail, receiveEur, recipientIban (last four), reference, updatedAt}`, for checkout transfers only. |
-| Core webhook → `POST /bff/zold/webhook` | Standard Webhooks signed `{"transferId"}`, a hint to read now. |
+| Core webhook → `POST /bff/zold/webhook` | Standard Webhooks signed `{"transferId"}`, `{"paymentRequestId", "linkId"}` or `{"linkId"}`: a hint to read now, never a state. |
+| `POST /api/service/merchant/links/preview` | Shopify adapter, `ZOLD_SERVICE_TOKEN`. `{code, shop}` → `{shop, orgName, payeeHandle, payeeDisplayName?, expiresAt?}` for the confirmation page. Does not spend the code. |
+| `POST /api/service/merchant/links/exchange` | `{code, shop}` → `{linkId, shop, orgName, payeeHandle, linkSecret}` (64 hex). Only after a preview (else 409 `LINK_NOT_CONFIRMED`); the code is spent on the first call. |
+| `GET /api/service/merchant/links/:linkId` | `{linkId, shop, active, revokedAt?}`. |
+| `POST /api/service/merchant/links/:linkId/payment-requests` | `{amountEur (whole cents), description?, test?, order: {gid, name?}}` → the service view `{id, code, handle, state, amountEur, order.gid, shop, payments, pageUrl, publicPath}`; idempotent on (shop, order gid). `pageUrl` must be on `CORE_PUBLIC_URL`'s origin under `/pay/`. 403 `LINK_REVOKED` disables the store; 409 `NO_PAYMENT_PAGE` is logged as `SHOPIFY_LINK_STALE`. |
+| `GET /api/service/merchant/links/:linkId/payment-requests/:id` | The service view; read by the order settle loop. |
+| `POST /api/service/merchant/links/:linkId/payment-requests/:id/cancel` | The service view, or 409 `NOT_CANCELLABLE` with `request: <view>`. |
+| `GET /api/pay/:handle/:code` | Zold's public projection; the thank-you block gets an allowlist of its fields (`docs/shopify.md`), never `code`, URLs back, bank details or `txHash`. |
+
+On every merchant-link route, only a 400, 403, 404 or 409 with a `code` is a
+refusal; a 401, 429, 5xx or timeout is an outage and is retried.
 
 Also load-bearing, and not an endpoint:
 
@@ -495,15 +506,26 @@ finishes up to 10 minutes after the checkout's 15-minute window is still accepte
 server/src/config.ts        env and every production refusal; the loopback gate on the dev shortcuts
 server/src/env-file.ts      the strict .env parser
 server/src/core.ts          typed client for the core API (this service's own calls)
-server/src/store.ts         merchants and payment intents (crash-safe JSON file)
+server/src/store.ts         merchants, payment intents and Shopify rows (crash-safe JSON file)
 server/src/checkout.ts      the authorization-server logic
 server/src/proxy.ts         the allowlist
 server/src/settle.ts        AUTHORIZED → PAID / FAILED, read with Zold's service credential
-server/src/zold-webhook.ts  Zold's signed "read this transfer now" hint
+server/src/zold-webhook.ts  Zold's signed "read this now" hints (transfer, Shopify order, merchant link)
+server/src/core-merchant.ts typed client for Zold's merchant-link service routes (Shopify)
+server/src/shopify.ts       the Shopify adapter's wiring (docs/shopify.md)
+server/src/shopify-context.ts   shared settings, sealed secrets, disabling a store
+server/src/shopify-hmac.ts      Shopify's webhook and OAuth HMACs, shop and URL checks
+server/src/shopify-admin.ts     calls to Shopify: OAuth code exchange, Admin GraphQL
+server/src/shopify-install.ts   /shopify/install, /shopify/callback and the /shopify/confirm page
+server/src/shopify-webhooks.ts  POST /shopify/webhooks (raw body)
+server/src/shopify-orders.ts    the buyer's order lookup and email pay link
+server/src/shopify-settle.ts    Zold PAID → "Mark as paid" on the order
 server/src/server.ts        checkout routes, /bff/* routes, proxy mount, static page
 web/checkout.html           the checkout page
 web/device.js               verbatim copy of the core's services/api/public/device.js
 web/vendor/                 verbatim copy (noble secp256k1 and hashes)
+shopify-app/                the Shopify app config and thank-you page extension
 scripts/harness-smoke.ts    wiring check against a local core (refuses real money)
 docs/adr/                   architecture decisions
+docs/shopify.md             the Shopify adapter: setup, what it does, what has never run
 ```

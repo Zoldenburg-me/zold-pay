@@ -1,0 +1,33 @@
+# Zold — pay the order on the thank-you page.
+#
+# Renders the order's Zold payment request (USDC amount, address, QR, live
+# state) on the Thank you page right after "Place order". The target is
+# available on every Shopify plan; pre-purchase checkout targets are not,
+# and none of them could add a payment method anyway. There is no Order
+# status block: that page has no checkout token to prove the buyer, and it
+# cannot tell a Zold order from a card one. A returning buyer uses the
+# signed link in the confirmation email.
+api_version = "2026-07"
+
+[[extensions]]
+type = "ui_extension"
+name = "Zold — pay with crypto"
+handle = "zold-pay"
+description = "Shows the order's Zold payment (USDC amount, address and QR) on the thank-you page and updates when the payment is seen."
+
+  [[extensions.targeting]]
+  module = "./src/ThankYou.jsx"
+  target = "purchase.thank-you.block.render"
+
+  [extensions.capabilities]
+  # The block polls the Zold Checkout service for the order's payment request,
+  # sending the checkout token as proof. That route answers CORS-open.
+  network_access = true
+  api_access = false
+
+  [extensions.settings]
+    [[extensions.settings.fields]]
+    key = "checkout_origin"
+    type = "single_line_text_field"
+    name = "Zold Checkout origin"
+    description = "The Zold Checkout service this store is connected through, e.g. https://checkout.example (no trailing slash)."

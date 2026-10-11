@@ -455,3 +455,11 @@ describe("health", () => {
     assert.equal((await call("/api/health")).status, 404);
   });
 });
+
+describe("Shopify off", () => {
+  it("with no SHOPIFY_API_KEY / SHOPIFY_API_SECRET, no /shopify route exists", async () => {
+    for (const p of ["/shopify/install?shop=a.myshopify.com&link=x", "/shopify/callback", "/shopify/orders/a.myshopify.com/1"]) {
+      assert.equal((await call(p)).status, 404, p);
+    }
+  });
+});

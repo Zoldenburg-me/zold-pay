@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 process.env.CHECKOUT_SUBJECT_SECRET = "test-subject-secret";
-const { assertConfigSane, CONFIG, devShortcutsEnabled, originIsLoopback, settlementWarning } = await import("../server/src/config.js");
+const { assertConfigSane, CONFIG, devShortcutsEnabled, originIsLoopback, settlementWarning, shopifyTokenKey } = await import("../server/src/config.js");
 
 const prod = () => ({
   ...CONFIG,
@@ -193,5 +193,90 @@ describe("settlement settings", () => {
       assert.match(r.stderr, /SETTLE_POLL_SECONDS/, value);
     }
     assert.equal(CONFIG.settlePollMs, 60_000);
+  });
+});
+
+describe("Shopify settings", () => {
+  const KEY = Buffer.alloc(32, 9).toString("base64");
+  const shop = (over: Partial<typeof CONFIG.shopify> = {}) => ({
+    ...prod(),
+    shopify: {
+      ...CONFIG.shopify,
+      enabled: true,
+      apiKey: "app-key",
+      apiSecret: "app-secret-value",
+      tokenKey: KEY,
+      corePublicUrl: "https://zold.example",
+      shopBaseUrl: "",
+      ...over,
+    },
+  });
+
+  it("is off by default, and off is accepted", () => {
+    assert.equal(CONFIG.shopify.enabled, false);
+    assert.doesNotThrow(() => assertConfigSane(prod()));
+  });
+
+  it("has the documented defaults", () => {
+    assert.equal(CONFIG.shopify.scopes, "read_orders,write_orders");
+    assert.equal(CONFIG.shopify.manualGateway, "zold");
+    assert.equal(CONFIG.shopify.apiVersion, "2026-07");
+  });
+
+  it("accepts a complete production configuration", () => {
+    assert.doesNotThrow(() => assertConfigSane(shop()));
+    assert.equal(shopifyTokenKey(shop())?.length, 32);
+  });
+
+  it("refuses a key without its secret and a secret without its key", () => {
+    assert.throws(() => assertConfigSane(shop({ enabled: false, apiSecret: "" })), /SHOPIFY_API_KEY and SHOPIFY_API_SECRET/);
+    assert.throws(() => assertConfigSane(shop({ enabled: false, apiKey: "" })), /SHOPIFY_API_KEY and SHOPIFY_API_SECRET/);
+  });
+
+  it("refuses a missing or wrong-length token key, and never echoes it", () => {
+    for (const bad of ["", Buffer.alloc(16, 1).toString("base64"), Buffer.alloc(33, 1).toString("base64"), "not base64!"]) {
+      assert.throws(() => assertConfigSane(shop({ tokenKey: bad })), (e: Error) => /SHOPIFY_TOKEN_KEY/.test(e.message) && (!bad || !e.message.includes(bad)));
+    }
+  });
+
+  it("requires the service token, since every order is opened and read with it", () => {
+    assert.throws(() => assertConfigSane({ ...shop(), zoldServiceToken: "", settleDisabled: true }), /ZOLD_SERVICE_TOKEN/);
+  });
+
+  it("requires CORE_PUBLIC_URL, https in production", () => {
+    assert.throws(() => assertConfigSane(shop({ corePublicUrl: "" })), /CORE_PUBLIC_URL/);
+    assert.throws(() => assertConfigSane(shop({ corePublicUrl: "javascript:alert(1)" })), /CORE_PUBLIC_URL/);
+    assert.throws(() => assertConfigSane(shop({ corePublicUrl: "http://zold.example" })), /CORE_PUBLIC_URL must be https/);
+    const dev = { ...shop({ corePublicUrl: "http://localhost:3000" }), production: false, environment: "development" as const, coreApiUrl: "http://127.0.0.1:3000" };
+    assert.doesNotThrow(() => assertConfigSane(dev));
+  });
+
+  it("refuses a malformed API version, scope list or gateway name", () => {
+    assert.throws(() => assertConfigSane(shop({ apiVersion: "latest" })), /SHOPIFY_API_VERSION/);
+    assert.throws(() => assertConfigSane(shop({ scopes: "read_orders write_orders;" })), /SHOPIFY_SCOPES/);
+    assert.throws(() => assertConfigSane(shop({ manualGateway: "<script>" })), /SHOPIFY_MANUAL_GATEWAY/);
+  });
+
+  it("allows the shop-base test seam only on loopback and never in production", () => {
+    const dev = { ...shop(), production: false, environment: "development" as const, coreApiUrl: "http://127.0.0.1:3000" };
+    assert.doesNotThrow(() => assertConfigSane({ ...dev, shopify: { ...dev.shopify, shopBaseUrl: "http://127.0.0.1:9" } }));
+    assert.throws(() => assertConfigSane({ ...dev, shopify: { ...dev.shopify, shopBaseUrl: "https://stub.example" } }), /SHOPIFY_SHOP_BASE_URL/);
+    assert.throws(() => assertConfigSane(shop({ shopBaseUrl: "http://127.0.0.1:9" })), /SHOPIFY_SHOP_BASE_URL must not be set in production/);
+  });
+
+  it("reads the Shopify settings from the environment", () => {
+    const entry = pathToFileURL(path.join(ROOT, "server/src/config.ts")).href;
+    const r = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", `const c = await import(${JSON.stringify(entry)}); console.log(JSON.stringify({ ...c.CONFIG.shopify, apiSecret: undefined, tokenKey: undefined }))`],
+      {
+        cwd: ROOT, encoding: "utf8", timeout: 20_000,
+        env: { ...process.env, SHOPIFY_API_KEY: "k", SHOPIFY_API_SECRET: "s", SHOPIFY_MANUAL_GATEWAY: "Zold Pay", CORE_PUBLIC_URL: "https://zold.example/" },
+      },
+    );
+    const parsed = JSON.parse(r.stdout.trim().split("\n").at(-1)!);
+    assert.equal(parsed.enabled, true);
+    assert.equal(parsed.manualGateway, "zold pay");
+    assert.equal(parsed.corePublicUrl, "https://zold.example");
   });
 });

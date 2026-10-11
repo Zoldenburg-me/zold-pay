@@ -1,7 +1,10 @@
 /**
- * Zold's checkout webhook: "transfer X changed state, read it now".
+ * Zold's checkout webhook: "this changed, read it now".
  *
- *   POST /bff/zold/webhook   body {"transferId": "..."}, Standard Webhooks signed
+ *   POST /bff/zold/webhook   Standard Webhooks signed, one of
+ *     {"transferId": "..."}                       a checkout's transfer (settle.ts)
+ *     {"paymentRequestId": "...", "linkId": "..."} a Shopify order's request was paid or cancelled
+ *     {"linkId": "..."}                            a merchant link was revoked
  *
  * Mounted only when ZOLD_WEBHOOK_SECRET is set, and before the JSON parser,
  * because the signature is over the raw bytes. The delivery is never believed
@@ -21,7 +24,7 @@ import { isId } from "./validate.js";
 
 /** The replay window: a delivery signed further from now than this is refused. */
 export const TOLERANCE_SEC = 300;
-/** The body is `{"transferId":"<uuid>"}`; anything near this size is not from Zold. */
+/** Each body is a few ids; anything near this size is not from Zold. */
 const BODY_LIMIT = "4kb";
 const MAX_ID = 128;
 const MAX_SIGNATURE = 1024;
@@ -68,8 +71,13 @@ function checkStandardWebhook(input: WebhookInput): "ok" | "bad_timestamp" | "ba
   return matches ? "ok" : "bad_signature";
 }
 
-/** `{"transferId": id}` and nothing else, or undefined. */
-function parseBody(raw: Buffer): string | undefined {
+export type ZoldHint =
+  | { kind: "transfer"; transferId: string }
+  | { kind: "paymentRequest"; paymentRequestId: string; linkId: string }
+  | { kind: "link"; linkId: string };
+
+/** Exactly one of the three bodies, every value a plain id, no other key; or undefined. */
+export function parseHint(raw: Buffer): ZoldHint | undefined {
   let body: unknown;
   try {
     body = JSON.parse(raw.toString("utf8"));
@@ -77,15 +85,24 @@ function parseBody(raw: Buffer): string | undefined {
     return undefined;
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const keys = Object.keys(body);
-  const transferId = (body as { transferId?: unknown }).transferId;
-  return keys.length === 1 && isId(transferId) ? transferId : undefined;
+  const b = body as Record<string, unknown>;
+  const keys = Object.keys(b).sort().join(",");
+  if (keys === "transferId" && isId(b.transferId)) return { kind: "transfer", transferId: b.transferId };
+  if (keys === "linkId,paymentRequestId" && isId(b.paymentRequestId) && isId(b.linkId)) {
+    return { kind: "paymentRequest", paymentRequestId: b.paymentRequestId, linkId: b.linkId };
+  }
+  if (keys === "linkId" && isId(b.linkId)) return { kind: "link", linkId: b.linkId };
+  return undefined;
 }
 
 export interface ZoldWebhookOptions {
   secret: string;
   /** Ask for this transfer's checkout to be read soon. Must not wait on Zold. */
   onTransfer: (transferId: string) => void;
+  /** Ask for this payment request's Shopify order to be read soon. Absent: the hint is acknowledged and dropped. */
+  onPaymentRequest?: (linkId: string, paymentRequestId: string) => void;
+  /** Ask for this merchant link to be read. Must not wait on Zold. Absent: acknowledged and dropped. */
+  onLink?: (linkId: string) => void;
   now?: () => number;
   log?: (...args: unknown[]) => void;
 }
@@ -143,11 +160,13 @@ export function createZoldWebhookRouter(opts: ZoldWebhookOptions): express.Route
         return res.status(401).json({ error: "bad signature" });
       }
       if (seen.has(id)) return res.status(204).end();
-      const transferId = parseBody(raw);
-      if (!transferId) return res.status(400).json({ error: "expected {transferId}" });
+      const hint = parseHint(raw);
+      if (!hint) return res.status(400).json({ error: "expected {transferId}, {paymentRequestId, linkId} or {linkId}" });
       remember(id, at);
-      // Same answer whether or not the transfer is one of ours.
-      opts.onTransfer(transferId);
+      // Same answer whether or not the object is one of ours.
+      if (hint.kind === "transfer") opts.onTransfer(hint.transferId);
+      else if (hint.kind === "paymentRequest") opts.onPaymentRequest?.(hint.linkId, hint.paymentRequestId);
+      else opts.onLink?.(hint.linkId);
       res.status(204).end();
     },
   );
