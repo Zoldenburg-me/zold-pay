@@ -8,12 +8,14 @@
  * Zold's webhook ({paymentRequestId, linkId}) only makes one due now; it is
  * never believed about a state.
  *
- * Only Zold's PAID marks an order paid. CANCELLED and EXPIRED close the row. A
+ * Only Zold's PAID, for the amount the request was opened for, marks an order
+ * paid (otherwise SHOPIFY_AMOUNT_MISMATCH). CANCELLED and EXPIRED close the row. A
  * refused "Mark as paid" is retried with a persisted backoff and logged as
  * SHOPIFY_MARK_FAILED; a refused metafield is logged as SHOPIFY_METAFIELD_FAILED
  * and does not undo the mark. A 401, 429 or 503 from Zold, or Zold
  * unreachable, ends the tick (SHOPIFY_SETTLE_STALLED, then SHOPIFY_SETTLE_RECOVERED).
  */
+import { toCents } from "./checkout.js";
 import { describeCoreFailure, isCoreOutage, type ServiceView } from "./core-merchant.js";
 import { accessTokenOf, errorText, type ShopifyContext } from "./shopify-context.js";
 import { SHOPIFY_CLOSED_STATES, store, type ShopifyOrder } from "./store.js";
@@ -85,9 +87,10 @@ export function createShopifySettler(ctx: ShopifyContext, opts: ShopifySettlerOp
     };
     if (!c || c.disabledReason === "app_uninstalled") return fail("the store is not connected");
     let token: string;
+    let alreadyPaid: boolean;
     try {
       token = accessTokenOf(ctx, c);
-      await ctx.admin.orderMarkAsPaid(row.shop, token, row.orderGid);
+      ({ alreadyPaid } = await ctx.admin.orderMarkAsPaid(row.shop, token, row.orderGid));
     } catch (err) {
       return fail(errorText(err));
     }
@@ -97,7 +100,7 @@ export function createShopifySettler(ctx: ShopifyContext, opts: ShopifySettlerOp
       lastError: undefined,
       nextAttemptAt: undefined,
     });
-    log(`shopify: marked order ${label(row)} paid`);
+    log(alreadyPaid ? `shopify: order ${label(row)} was already marked paid in Shopify` : `shopify: marked order ${label(row)} paid`);
     try {
       await ctx.admin.orderSetPaymentMetafield(row.shop, token, row.orderGid, {
         code: view.code,
@@ -135,6 +138,13 @@ export function createShopifySettler(ctx: ShopifyContext, opts: ShopifySettlerOp
     if (!fresh || fresh.markedPaidAt) return "closed";
     if (fresh.state !== view.state) store.updateShopifyOrder(row.shop, row.orderGid, { state: view.state });
     if (view.state === "PAID") {
+      if (toCents(view.amountEur) !== toCents(fresh.amountEur)) {
+        // Never mark an order paid for a request of another amount.
+        if (!mismatchReported.has(key)) log(`SHOPIFY_AMOUNT_MISMATCH order ${label(row)}: Zold's request is not for the order's amount; not marked paid`);
+        mismatchReported.add(key);
+        later(key, now);
+        return "mismatch";
+      }
       const outcome = await markPaid(store.findShopifyOrder(row.shop, row.orderGid)!, view, now);
       if (outcome === "marked") forget(key);
       return outcome;

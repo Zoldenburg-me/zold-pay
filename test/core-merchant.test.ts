@@ -14,7 +14,7 @@ const view = (over: Record<string, unknown> = {}) => ({
   payments: [], pageUrl: "https://zold.example/pay/keycard/ABCDE-FGHIJ-KLMNO", publicPath: "/api/pay/keycard/ABCDE-FGHIJ-KLMNO",
   ...over,
 });
-const strict = { allowInsecureLoopback: false };
+const strict = { corePublicUrl: "https://zold.example" };
 
 describe("refusal or outage", () => {
   it("only a 400, 403, 404 or 409 carrying a code is a refusal", () => {
@@ -58,17 +58,39 @@ describe("parsing Zold's answers", () => {
     ["no amount", { amountEur: "12" }], ["no order", { order: { gid: "gid://shopify/Product/1" } }], ["a shop that is not myshopify", { shop: "evil.com" }],
     ["no payments", { payments: {} }], ["a public path elsewhere", { publicPath: "/api/admin/x" }], ["an http page URL", { pageUrl: "http://zold.example/pay" }],
     ["a page URL with credentials", { pageUrl: "https://u:p@zold.example/pay" }], ["a page URL that is not one", { pageUrl: "nope" }],
+    ["a page URL on another origin", { pageUrl: "https://evil.example/pay/keycard/ABCDE-FGHIJ-KLMNO" }],
+    ["a page URL on another port", { pageUrl: "https://zold.example:8443/pay/keycard/ABCDE-FGHIJ-KLMNO" }],
+    ["a page URL on a lookalike host", { pageUrl: "https://zold.example.evil.example/pay/keycard/ABCDE" }],
+    ["a page URL outside /pay/", { pageUrl: "https://zold.example/admin/keycard" }],
+    ["a page URL with an encoded segment", { pageUrl: "https://zold.example/pay/%2e%2e/admin" }],
+    ["a handle of dots", { handle: ".." }], ["a handle with %", { handle: "a%2Fb" }],
+    ["a public path through dots", { publicPath: "/api/pay/../ABCDE-FGHIJ" }],
+    ["a public path with a single dot", { publicPath: "/api/pay/./ABCDE-FGHIJ" }],
+    ["a public path with %", { publicPath: "/api/pay/a%2Fb/ABCDE-FGHIJ" }],
   ] as const) {
     it(`refuses a view with ${name}`, () => {
       assert.throws(() => cm.parseServiceView(view(over), strict), CoreResponseError);
     });
   }
 
-  it("accepts an http page URL on loopback only when told to", () => {
+  it("binds the page URL to Zold's public origin, whatever that is", () => {
     const local = view({ pageUrl: "http://localhost:3000/pay/k/ABCDE" });
     assert.throws(() => cm.parseServiceView(local, strict), CoreResponseError);
-    assert.doesNotThrow(() => cm.parseServiceView(local, { allowInsecureLoopback: true }));
-    assert.equal(cm.safePageUrl("http://zold.example/pay", true), false);
+    assert.doesNotThrow(() => cm.parseServiceView(local, { corePublicUrl: "http://localhost:3000" }));
+    assert.equal(cm.pageUrlOnCore("http://zold.example/pay/k/ABCDE", "https://zold.example"), false, "http is another origin");
+    assert.equal(cm.pageUrlOnCore("https://zold.example/pay/k/ABCDE", "not a url"), false);
+    assert.equal(cm.pageUrlOnCore(42, "https://zold.example"), false);
+  });
+
+  it("reads a link preview for the shop asked about, with the payee's display name when there is one", () => {
+    const good = { shop: "a.myshopify.com", orgName: "Org", payeeHandle: "h", payeeDisplayName: "H GmbH", expiresAt: "2026-10-11T09:15:00.000Z", extra: 1 };
+    assert.deepEqual(cm.parseLinkPreview(good, "a.myshopify.com"), {
+      shop: "a.myshopify.com", orgName: "Org", payeeHandle: "h", payeeDisplayName: "H GmbH", expiresAt: "2026-10-11T09:15:00.000Z",
+    });
+    assert.deepEqual(cm.parseLinkPreview({ ...good, payeeDisplayName: "", expiresAt: 5 }, "a.myshopify.com"), { shop: "a.myshopify.com", orgName: "Org", payeeHandle: "h" });
+    for (const bad of [{ ...good, shop: "b.myshopify.com" }, { ...good, orgName: "" }, { ...good, payeeHandle: 7 }, null]) {
+      assert.throws(() => cm.parseLinkPreview(bad, "a.myshopify.com"), CoreResponseError);
+    }
   });
 
   it("refuses a link exchange for another shop or without a proper secret", () => {
@@ -87,8 +109,10 @@ describe("parsing Zold's answers", () => {
   });
 
   it("will not read a public path that is not Zold's pay projection", async () => {
-    const core = cm.createMerchantCore({ token: "t", allowInsecureLoopback: false });
-    await assert.rejects(core.readPublic("/api/admin/users"), CoreResponseError);
+    const core = cm.createMerchantCore({ token: "t", corePublicUrl: "https://zold.example" });
+    for (const p of ["/api/admin/users", "/api/pay/../ABCDE-FGHIJ", "/api/pay/a%2F/ABCDE-FGHIJ"]) {
+      await assert.rejects(core.readPublic(p), CoreResponseError, p);
+    }
   });
 });
 
@@ -102,11 +126,10 @@ describe("Shopify helpers", () => {
     }
   });
 
-  it("keeps only https merchant URLs", () => {
-    assert.equal(h.externalHttpUrl("https://shop.example/s?x=1"), "https://shop.example/s?x=1");
-    for (const bad of ["http://shop.example", "javascript:alert(1)", "data:text/html,x", "", 5, `https://x.example/${"a".repeat(2100)}`]) {
-      assert.equal(h.externalHttpUrl(bad), undefined);
-    }
+  it("cleans an order name of control characters, and drops one that is empty or too long", () => {
+    assert.equal(h.cleanOrderName("#1001"), "#1001");
+    assert.equal(h.cleanOrderName(" #10\r\n01\u0007\u009b\u2029 "), "#1001");
+    for (const bad of ["", "\n\t", "#".repeat(41), 1001, undefined]) assert.equal(h.cleanOrderName(bad), undefined);
   });
 
   it("reads an order id in either form and nothing else", () => {

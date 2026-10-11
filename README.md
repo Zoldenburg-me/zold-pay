@@ -335,12 +335,13 @@ change any of these in the core, this is the list.
 | `GET /api/transfers/:id` | Session-scoped. Attach reads with the **payer's own bearer**; it must stay session-scoped rather than become public. |
 | `GET /api/service/checkout/transfers/:id` | With `ZOLD_SERVICE_TOKEN`: `{id, state, rail, receiveEur, recipientIban (last four), reference, updatedAt}`, for checkout transfers only. |
 | Core webhook → `POST /bff/zold/webhook` | Standard Webhooks signed `{"transferId"}`, `{"paymentRequestId", "linkId"}` or `{"linkId"}`: a hint to read now, never a state. |
-| `POST /api/service/merchant/links/exchange` | Shopify adapter, `ZOLD_SERVICE_TOKEN`. `{code, shop}` → `{linkId, shop, orgName, payeeHandle, linkSecret}` (64 hex). The code is spent on the first call. |
+| `POST /api/service/merchant/links/preview` | Shopify adapter, `ZOLD_SERVICE_TOKEN`. `{code, shop}` → `{shop, orgName, payeeHandle, payeeDisplayName?, expiresAt?}` for the confirmation page. Does not spend the code. |
+| `POST /api/service/merchant/links/exchange` | `{code, shop}` → `{linkId, shop, orgName, payeeHandle, linkSecret}` (64 hex). Only after a preview (else 409 `LINK_NOT_CONFIRMED`); the code is spent on the first call. |
 | `GET /api/service/merchant/links/:linkId` | `{linkId, shop, active, revokedAt?}`. |
-| `POST /api/service/merchant/links/:linkId/payment-requests` | `{amountEur (whole cents), description?, test?, order: {gid, name?, statusUrl?}}` → the service view `{id, code, handle, state, amountEur, order.gid, shop, payments, pageUrl, publicPath}`; idempotent on (shop, order gid). 403 `LINK_REVOKED` disables the store. |
+| `POST /api/service/merchant/links/:linkId/payment-requests` | `{amountEur (whole cents), description?, test?, order: {gid, name?}}` → the service view `{id, code, handle, state, amountEur, order.gid, shop, payments, pageUrl, publicPath}`; idempotent on (shop, order gid). `pageUrl` must be on `CORE_PUBLIC_URL`'s origin under `/pay/`. 403 `LINK_REVOKED` disables the store; 409 `NO_PAYMENT_PAGE` is logged as `SHOPIFY_LINK_STALE`. |
 | `GET /api/service/merchant/links/:linkId/payment-requests/:id` | The service view; read by the order settle loop. |
 | `POST /api/service/merchant/links/:linkId/payment-requests/:id/cancel` | The service view, or 409 `NOT_CANCELLABLE` with `request: <view>`. |
-| `GET /api/pay/:handle/:code` | Zold's public projection; relayed to the thank-you block minus `code`, `returnUrl`, `cancelUrl` and `txHash`. |
+| `GET /api/pay/:handle/:code` | Zold's public projection; the thank-you block gets an allowlist of its fields (`docs/shopify.md`), never `code`, URLs back, bank details or `txHash`. |
 
 On every merchant-link route, only a 400, 403, 404 or 409 with a `code` is a
 refusal; a 401, 429, 5xx or timeout is an outage and is retried.
@@ -515,7 +516,7 @@ server/src/shopify.ts       the Shopify adapter's wiring (docs/shopify.md)
 server/src/shopify-context.ts   shared settings, sealed secrets, disabling a store
 server/src/shopify-hmac.ts      Shopify's webhook and OAuth HMACs, shop and URL checks
 server/src/shopify-admin.ts     calls to Shopify: OAuth code exchange, Admin GraphQL
-server/src/shopify-install.ts   GET /shopify/install and /shopify/callback
+server/src/shopify-install.ts   /shopify/install, /shopify/callback and the /shopify/confirm page
 server/src/shopify-webhooks.ts  POST /shopify/webhooks (raw body)
 server/src/shopify-orders.ts    the buyer's order lookup and email pay link
 server/src/shopify-settle.ts    Zold PAID → "Mark as paid" on the order

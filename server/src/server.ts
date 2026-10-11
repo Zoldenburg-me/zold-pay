@@ -101,7 +101,6 @@ const shopify = CONFIG.shopify.enabled
         manualGateway: CONFIG.shopify.manualGateway,
         publicOrigin: CONFIG.publicOrigin,
         corePublicUrl: CONFIG.shopify.corePublicUrl,
-        allowInsecureLoopback: !CONFIG.production,
         tokenKey: shopifyTokenKey() as Buffer,
         admin: createShopifyAdmin({
           apiKey: CONFIG.shopify.apiKey,
@@ -110,7 +109,7 @@ const shopify = CONFIG.shopify.enabled
           apiVersion: CONFIG.shopify.apiVersion,
           shopBaseUrl: CONFIG.shopify.shopBaseUrl || undefined,
         }),
-        core: createMerchantCore({ token: CONFIG.zoldServiceToken, allowInsecureLoopback: !CONFIG.production }),
+        core: createMerchantCore({ token: CONFIG.zoldServiceToken, corePublicUrl: CONFIG.shopify.corePublicUrl }),
         log: (...args) => console.error(...args),
         now: Date.now,
       },
@@ -190,7 +189,7 @@ if (settler && CONFIG.zoldWebhookSecret) {
 // webhook itself is HMAC-gated and sent from Shopify's addresses, so it gets no
 // per-address limit; the install routes get the credential bucket.
 if (shopify) {
-  app.use(["/shopify/install", "/shopify/callback"], credentialLimit());
+  app.use(["/shopify/install", "/shopify/callback", "/shopify/confirm"], credentialLimit());
   app.use("/shopify/orders", generalLimit);
   app.use(shopify.router);
 }

@@ -15,7 +15,44 @@ import express from "express";
 import { describeCoreFailure, isCoreError, isCoreOutage } from "./core-merchant.js";
 import { linkSecretOf, type ShopifyContext } from "./shopify-context.js";
 import { isValidShopDomain, normaliseShop, numericOrderId, orderGidOf, orderLinkProof, sameHex, sha256Hex } from "./shopify-hmac.js";
-import { store } from "./store.js";
+import { store, type ShopifyOrder } from "./store.js";
+
+type Json = Record<string, unknown>;
+const isObject = (v: unknown): v is Json => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+const isScalar = (v: unknown) => typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v));
+
+/** Only `keys` of `from`, and only where the value is a string, number or boolean. */
+function pick(from: unknown, keys: readonly string[]): Json {
+  const out: Json = {};
+  if (!isObject(from)) return out;
+  for (const k of keys) if (isScalar(from[k])) out[k] = from[k];
+  return out;
+}
+
+const TOP = ["state", "amountEur", "outstandingEur", "paidEur", "currency", "test", "expiresAt", "paidAt"] as const;
+const CRYPTO = ["chainId", "address", "amountUsdc", "rate", "allowanceBps", "validUntil", "uri"] as const;
+const TOKEN = ["symbol", "chainName", "decimals", "address"] as const;
+const PAYMENT = ["method", "amountEur", "amountUsdc", "kind", "at"] as const;
+
+/**
+ * What the thank-you block may see, built field by field from Zold's public
+ * projection: the amount and state, the crypto payment details it renders, and
+ * each payment without its transaction hash (a hash ties the buyer's wallet to
+ * the order). Nothing else Zold adds there, now or later, passes through: no
+ * code, no return or cancel URL, no bank details, no names.
+ */
+export function buyerProjection(p: Json, order: ShopifyOrder): Json {
+  const crypto = isObject(p.methods) ? p.methods.crypto : undefined;
+  return {
+    ...pick(p, TOP),
+    ...(isObject(crypto)
+      ? { methods: { crypto: { ...pick(crypto, CRYPTO), ...(isObject(crypto.token) ? { token: pick(crypto.token, TOKEN) } : {}) } } }
+      : {}),
+    payments: Array.isArray(p.payments) ? p.payments.map((x) => pick(x, PAYMENT)) : [],
+    pageUrl: order.pageUrl,
+    ...(order.orderName ? { orderName: order.orderName } : {}),
+  };
+}
 
 const NOT_YET = { error: "no payment request for this order yet", pending: true };
 const BAD_LINK =
@@ -42,10 +79,9 @@ export function createShopifyOrdersRouter(ctx: ShopifyContext): express.Router {
 
   /**
    * What the thank-you page extension polls. It runs in Shopify's checkout
-   * sandbox, so the answer is CORS-open. With the order's checkout token: Zold's
-   * public projection of the request (no IBAN, no name), without the payment
-   * code, the return and cancel URLs or any transaction hash, plus the pay
-   * page's URL and the order name.
+   * sandbox, so the answer is CORS-open. With the order's checkout token: the
+   * allowlisted part of Zold's public projection (buyerProjection), plus the
+   * pay page's URL and the order name.
    */
   router.get("/shopify/orders/:shop/:orderId", async (req, res, next) => {
     res.setHeader("access-control-allow-origin", "*");
@@ -64,20 +100,7 @@ export function createShopifyOrdersRouter(ctx: ShopifyContext): express.Router {
         ctx.log(`shopify: order lookup for ${order.orderGid} at ${order.shop} failed: ${describeCoreFailure(err)}`);
         return res.status(502).json({ error: "the payment could not be loaded; try again" });
       }
-      const { code: _code, returnUrl: _ret, cancelUrl: _cancel, payments, ...rest } = projection;
-      res.json({
-        ...rest,
-        // The state, not the payer's transaction: a hash ties the buyer's wallet to the order.
-        payments: Array.isArray(payments)
-          ? payments.map((p) => {
-              if (!p || typeof p !== "object") return {};
-              const { txHash: _tx, ...kept } = p as Record<string, unknown>;
-              return kept;
-            })
-          : [],
-        pageUrl: order.pageUrl,
-        ...(order.orderName ? { orderName: order.orderName } : {}),
-      });
+      res.json(buyerProjection(projection, order));
     } catch (err) {
       next(err);
     }

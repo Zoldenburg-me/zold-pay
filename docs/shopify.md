@@ -64,7 +64,9 @@ program approval, which nobody has. Only the custom-app mode is here.
    (`SHOPIFY_MANUAL_GATEWAY`). Store currency for checkout: EUR.
 2. In Zold's **/business → Shopify**, enter the store's `myshopify.com` domain
    and connect. Zold sends you to this service, which sends you to Shopify to
-   approve the app, and back to Zold.
+   approve the app. Back here, a page names the store, the organisation and
+   the account the store will pay into: press **Link this store** (in the same
+   browser) and you return to Zold.
 3. In the store's **checkout editor**, add the "Zold — pay with crypto" block to
    the **Thank you** page and set its **Zold Checkout origin** to this service's
    origin.
@@ -77,21 +79,36 @@ program approval, which nobody has. Only the custom-app mode is here.
 ### Connecting a store
 
 `GET /shopify/install?shop=<shop>&link=<zlc_ code>` is where Zold's /business
-sends the merchant. The link code is Zold's one-time, 15-minute record of the
+sends the merchant. The link code is Zold's one-time, 15-minute record of an
 organisation's consent for that shop. It is kept in memory under an OAuth state
-nonce and the merchant goes to Shopify to approve.
+nonce, the install is bound to the browser with an HttpOnly, Secure,
+SameSite=Lax cookie (`__Host-zold-shopify-install`), and the merchant goes to
+Shopify to approve.
 
-`GET /shopify/callback` checks Shopify's query HMAC (constant time), the state
-and the shop; exchanges Shopify's code for the store's offline access token;
-exchanges the link code with Zold (`POST /api/service/merchant/links/exchange`)
-for the link id and the store's pay-link secret; seals both secrets
-(AES-256-GCM, associated data `purpose|connection id`) and stores the
-connection; subscribes `orders/create`, `orders/cancelled` and `app/uninstalled`
-at `/shopify/webhooks`; and sends the merchant back to
-`<CORE_PUBLIC_URL>/business?view=shopify&shop=<shop>` (with `error=` and, for
-Zold's refusals, its `code`). If Zold does not accept the link, the Shopify
-token is dropped, never stored. The link code is spent by Zold on its first use
-whatever the answer, so a failed exchange is not retried: the merchant starts again.
+`GET /shopify/callback` checks Shopify's query HMAC (constant time), the state,
+the shop and the cookie; exchanges Shopify's code for the store's offline
+access token; and asks Zold who the link is for
+(`POST /api/service/merchant/links/preview`, which does not spend the code). The
+token is held in memory only, sealed, for 15 minutes, under a random id, and the
+store's admin sees a page naming the shop, the organisation and the payee
+(every value escaped, a CSP that allows no script and posts only here and to
+Zold) with **Link this store** and **Cancel**.
+
+`POST /shopify/confirm` needs the page's id and the same cookie, and answers
+once. Only "Link this store" exchanges the link code with Zold
+(`POST /api/service/merchant/links/exchange`, which Zold refuses with
+`LINK_NOT_CONFIRMED` unless the code was previewed) for the link id and the
+store's pay-link secret; seals both secrets (AES-256-GCM, associated data
+`purpose|connection id`) and stores the connection; subscribes `orders/create`,
+`orders/cancelled` and `app/uninstalled` at `/shopify/webhooks`; and sends the
+merchant back to `<CORE_PUBLIC_URL>/business?view=shopify&shop=<shop>` (with
+`error=` and, for Zold's refusals, its `code`).
+
+The confirmation is what stops a member of any Zold organisation from minting a
+link for a shop that is not theirs and having its admin connect it in one
+click. A Shopify token whose link was not confirmed or not accepted is never
+written to disk. The link code is spent by Zold on its first exchange whatever
+the answer, so a failed exchange is not retried: the merchant starts again.
 
 ### Orders
 
@@ -104,18 +121,25 @@ another shop is refused.
 - **orders/create** opens a request (`POST .../links/:linkId/payment-requests`)
   only for a pending order whose payment method name contains the gateway
   name, in EUR, with a total above 0 and at most Zold's ceiling, rounded to
-  whole cents. The order status URL is passed on only if it is https. Only the
-  SHA-256 of the order's checkout token is kept. Anything else is acknowledged
-  with a 200 and ignored: Shopify drops a subscription that keeps failing.
+  whole cents. Zold gets the amount, the order's gid and its name (control
+  characters removed), nothing about the buyer. Only the SHA-256 of the order's
+  checkout token is kept. Anything else is acknowledged with a 200 and ignored:
+  Shopify drops a subscription that keeps failing.
 - **orders/cancelled** asks Zold to cancel the request. One that cannot be
-  (paid, or already cancelled or expired) comes back with its state.
-- **app/uninstalled** disables the connection. Requests already open stay open.
+  (paid, or already cancelled or expired) comes back with its state. A cancel
+  for an order with no request yet is remembered for 72 hours, so an
+  orders/create that arrives after it opens nothing (and one being opened at
+  that moment is cancelled once it is).
+- **app/uninstalled** disables the connection and closes its orders (see
+  *Privacy and retention*). One triggered (`X-Shopify-Triggered-At`) before the
+  current install is ignored.
 - Zold refusing (400, 403, 404, 409 with a `code`) is acknowledged. A revoked
   link (`LINK_REVOKED`) disables the connection and removes its webhook
-  subscriptions. `ORDER_TAKEN` for an order we already hold (opened under the
-  store's earlier link) is "already opened": the row keeps its original link id
-  and is read, cancelled and settled through it. `NO_PAYMENT_PAGE` (the link's
-  payee can no longer be paid) is logged as `SHOPIFY_LINK_STALE` and not
+  subscriptions. An order already held here (opened under the store's earlier
+  link) is never sent to Zold again: the row keeps its original link id and is
+  read, cancelled and settled through it. `ORDER_TAKEN` for an order not held
+  here is logged and acknowledged. `NO_PAYMENT_PAGE` (the link's
+  payee cannot be paid) is logged as `SHOPIFY_LINK_STALE` and not
   retried; the order stays unpaid in Shopify until the store is linked again. Zold answering 401, 429 or 5xx, timing out or unreachable is
   **not** a refusal: the delivery answers 503, stays unhandled, and Shopify's
   retry processes it again.
@@ -129,16 +153,21 @@ stays open, at most 50 a tick. Zold's webhook hint
 `{"paymentRequestId", "linkId"}` makes one due now; it is never believed about
 a state.
 
-- **PAID** → `orderMarkAsPaid`, then a `zold.payment` JSON metafield with the
-  payment code, amount and payments. A refused metafield is logged and does not
-  undo the mark. A refused mark is recorded on the order and retried from 30
-  seconds, doubling to an hour.
+- **PAID** for the amount the request was opened for → `orderMarkAsPaid`, then
+  a `zold.payment` JSON metafield with the payment code, the amount and each
+  payment, **including its transaction hash**, for the merchant. A request of
+  any other amount is never marked (`SHOPIFY_AMOUNT_MISMATCH`). A refused
+  metafield is logged and does not undo the mark. A refused mark is recorded on
+  the order and retried from 30 seconds, doubling to an hour; refused because
+  Shopify shows the order PAID already (the merchant pressed it by hand) counts
+  as marked.
 - **CANCELLED** or **EXPIRED** → the order is closed here.
 - A 401, 429 or 503 from Zold, or Zold unreachable, ends the tick.
 
 Log tokens to alert on: `SHOPIFY_SETTLE_STALLED` / `SHOPIFY_SETTLE_RECOVERED`,
 `SHOPIFY_MARK_FAILED` (first failure and every tenth), `SHOPIFY_METAFIELD_FAILED`,
 `SHOPIFY_SETTLE_MISMATCH` (Zold answered about another order),
+`SHOPIFY_AMOUNT_MISMATCH`,
 `SHOPIFY_STORE_WRITE_FAILED`, `SHOPIFY_ORDER_REFUSED`, `SHOPIFY_CANCEL_REFUSED`,
 `SHOPIFY_SUBSCRIBE_FAILED`, `SHOPIFY_DISABLED`, `SHOPIFY_LINK_READ_FAILED`,
 `SHOPIFY_LINK_STALE`.
@@ -156,27 +185,71 @@ the buyer holds, and without it answers the same whether the order exists or not
 
 - `GET /shopify/orders/:shop/:orderId?t=<checkout token>` is what the thank-you
   block polls (CORS-open, `no-store`, `noindex`). With the order's checkout
-  token: Zold's public projection of the request, without the payment code, the
-  return and cancel URLs or any transaction hash, plus the pay page URL and the
-  order name. Without it: the same `404 {pending: true}` as an unknown order.
+  token, an allowlist built field by field from Zold's public projection:
+  `state`, `amountEur`, `outstandingEur`, `paidEur`, `currency`, `test`,
+  `expiresAt`, `paidAt`, `methods.crypto` (`chainId`, `token`, `address`,
+  `amountUsdc`, `rate`, `allowanceBps`, `validUntil`, `uri`) and `payments`
+  (`method`, `amountEur`, `amountUsdc`, `kind`, `at`; no transaction hash), plus
+  the pay page URL and the order name. No payment code, return or cancel URL,
+  bank details or names, and nothing Zold adds later. Without the token: the
+  same `404 {pending: true}` as an unknown order. Once the order is marked paid
+  or closed the token's hash is deleted, so the block then sees the same 404.
 - `GET /shopify/orders/:shop/:orderId/pay?b=<proof>` is the email link. `b` must
   be HMAC-SHA256 of the numeric order id under the store's link secret (what
   Liquid's `hmac_sha256` renders), compared in constant time; then a 302 to the
-  pay page. Without it: the same 403 text whether the order or store exists or not.
+  pay page. A pay page URL from Zold is accepted only on `CORE_PUBLIC_URL`'s
+  origin under `/pay/`. Without it: the same 403 text whether the order or store exists or not.
 
 `/bff/health` and `/bff/config` say nothing about Shopify.
 
-## Data
+## Privacy and retention
 
-`data/checkout.json` gains `shopifyConnections` (one per shop: link id, sealed
-access token and link secret, scope, webhook subscription ids, disabled
-reason) and `shopifyOrders` (keyed by shop and order gid: the request's id,
-handle, code, public path and pay page URL, the checkout token's hash, Zold's
-last state, and the mark-paid record). A file written before these lists gets
-them empty on load. Orders that are marked paid or closed are swept after 90
-days.
+**Read from an order** (orders/create): its id and name, total, currency,
+financial status, payment method names, `test` flag and checkout token. The rest
+of Shopify's order body (customer, addresses, line items, `order_status_url`) is
+neither kept nor passed on.
+
+**Sent to Zold:** the amount, the order's gid and name, a description
+(`Order <name> at <shop>`) and the test flag. Nothing about the buyer.
+
+**Kept** in `data/checkout.json`:
+- `shopifyConnections`, one per shop: the link id, the sealed access token and
+  pay-link secret, the scope, the webhook subscription ids, and why it was
+  disabled.
+- `shopifyOrders`, keyed by shop and order gid: the request's id, handle, payment
+  code, public path and pay page URL, the amount, the order name, the SHA-256 of
+  the checkout token, Zold's last state and the mark-paid record. The checkout
+  token's hash is deleted as soon as the order is marked paid or closed. An order
+  that is marked paid or closed is deleted 90 days after its last change.
+- A file written before these lists gets them empty on load.
+
+**In memory only:** delivery ids (72 hours), started installs and confirmation
+pages (15 minutes, the latter with the sealed access token), and cancel
+tombstones (72 hours).
+
+**Sent to the merchant's Shopify:** "Mark as paid", and the `zold.payment`
+metafield on the order with the payment code, the amount and each payment's
+method, amounts, time and **transaction hash**. The hash links the buyer's
+wallet to the order, for the merchant only; it is never in the buyer-facing
+lookup.
+
+**On app/uninstalled:** the access token is deleted (Shopify revoked it), the
+webhook subscription ids are cleared, the store's orders count as closed (out
+of settlement, checkout-token hashes deleted) and are deleted 90 days later.
+Requests already open at Zold stay open there; money that arrives still lands
+in the organisation's account.
 
 ## Known gaps
+
+Not built:
+- **Shopify's mandatory privacy webhooks** (`customers/data_request`,
+  `customers/redact`, `shop/redact`). A public app needs them; a custom-distribution
+  app is not reviewed for them, but the data they ask about is the order rows above.
+- **A reconciliation poll** for orders whose orders/create never arrived within
+  Shopify's 48-hour retry window. Such an order has no request and stays unpaid
+  in Shopify.
+
+Known:
 
 - The delivery-id memory and the started installs are in memory: after a
   restart the order-level idempotency (shop + order gid, here and at Zold) is
@@ -184,6 +257,4 @@ days.
 - A store reconnected through a new link gets a new pay-link secret, so links in
   confirmation emails sent before it stop opening; the thank-you page block is
   unaffected.
-- A merchant who marks an order paid by hand makes our "Mark as paid" fail; it
-  is retried up to hourly and logged every tenth failure.
 - One process: the settle loop and the in-memory maps assume a single instance.
