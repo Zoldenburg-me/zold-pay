@@ -1,0 +1,9 @@
+{
+  "name": "zold-pay",
+  "private": true,
+  "dependencies": {
+    "@shopify/ui-extensions": "2026.7.x",
+    "@shopify/ui-extensions-react": "2026.7.x",
+    "react": "^18.3.1"
+  }
+}

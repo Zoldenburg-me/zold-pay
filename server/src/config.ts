@@ -105,6 +105,25 @@ export interface Config {
   settlePollMs: number;
   /** SETTLE_DISABLED=1: run in production without ZOLD_SERVICE_TOKEN, knowing nothing settles. */
   settleDisabled: boolean;
+  /** The Shopify adapter (custom-app mode). Off unless both SHOPIFY_API_KEY and SHOPIFY_API_SECRET are set. */
+  shopify: ShopifyConfig;
+}
+
+export interface ShopifyConfig {
+  /** Both the app key and secret are set. Neither: Shopify is off and no /shopify route exists. */
+  enabled: boolean;
+  apiKey: string;
+  apiSecret: string;
+  scopes: string;
+  /** Lower-case substring of the store's manual payment method name that marks a Zold order. */
+  manualGateway: string;
+  apiVersion: string;
+  /** Base64 of the 32-byte AES-256-GCM key that seals access tokens and link secrets at rest. */
+  tokenKey: string;
+  /** Zold's public origin, where the merchant goes back to after an install (/business). */
+  corePublicUrl: string;
+  /** Test seam: every shop is reached at <base>/<shop>/… instead of https://<shop>. Refused in production. */
+  shopBaseUrl: string;
 }
 
 const publicOrigin = (process.env.CHECKOUT_PUBLIC_ORIGIN ?? "http://localhost:3100").replace(/\/+$/, "");
@@ -176,6 +195,19 @@ export const CONFIG: Config = {
   zoldWebhookSecret: (process.env.ZOLD_WEBHOOK_SECRET ?? "").trim(),
   settlePollMs: settleSeconds(process.env.SETTLE_POLL_SECONDS) * 1000,
   settleDisabled: bool(process.env.SETTLE_DISABLED, false),
+
+  shopify: {
+    enabled: Boolean((process.env.SHOPIFY_API_KEY ?? "").trim() && (process.env.SHOPIFY_API_SECRET ?? "").trim()),
+    apiKey: (process.env.SHOPIFY_API_KEY ?? "").trim(),
+    apiSecret: (process.env.SHOPIFY_API_SECRET ?? "").trim(),
+    scopes: (process.env.SHOPIFY_SCOPES ?? "").trim() || "read_orders,write_orders",
+    manualGateway: ((process.env.SHOPIFY_MANUAL_GATEWAY ?? "").trim() || "zold").toLowerCase(),
+    // The Admin API version Zold's own Shopify code uses (services/api config/partners.ts).
+    apiVersion: (process.env.SHOPIFY_API_VERSION ?? "").trim() || "2026-07",
+    tokenKey: (process.env.SHOPIFY_TOKEN_KEY ?? "").trim(),
+    corePublicUrl: (process.env.CORE_PUBLIC_URL ?? "").trim().replace(/\/+$/, ""),
+    shopBaseUrl: (process.env.SHOPIFY_SHOP_BASE_URL ?? "").trim().replace(/\/+$/, ""),
+  },
 };
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -236,6 +268,48 @@ function assertSettlementSane(cfg: Config): void {
   }
 }
 
+const SHOPIFY_TOKEN_KEY_BYTES = 32;
+const API_VERSION = /^\d{4}-\d{2}$/;
+
+/** The 32-byte sealing key, or undefined when SHOPIFY_TOKEN_KEY is not a base64 encoding of exactly 32 bytes. */
+export function shopifyTokenKey(cfg: Config = CONFIG): Buffer | undefined {
+  const v = cfg.shopify.tokenKey;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(v)) return undefined;
+  const key = Buffer.from(v, "base64");
+  return key.length === SHOPIFY_TOKEN_KEY_BYTES ? key : undefined;
+}
+
+/**
+ * The Shopify adapter's settings. Half-configured is refused rather than run:
+ * a key without its secret, an access token with nowhere safe to keep it, an
+ * install with nowhere to send the merchant back. Errors name settings, never values.
+ */
+function assertShopifySane(cfg: Config): void {
+  const s = cfg.shopify;
+  if (Boolean(s.apiKey) !== Boolean(s.apiSecret)) {
+    throw new Error("SHOPIFY_API_KEY and SHOPIFY_API_SECRET must be set together (both unset turns Shopify off).");
+  }
+  if (!s.enabled) return;
+  if (!shopifyTokenKey(cfg)) {
+    throw new Error(`SHOPIFY_TOKEN_KEY must be base64 of ${SHOPIFY_TOKEN_KEY_BYTES} random bytes when Shopify is on: it seals each store's access token.`);
+  }
+  if (!cfg.zoldServiceToken) {
+    throw new Error("Shopify is on but ZOLD_SERVICE_TOKEN is not set: every order's payment request is opened and read with it.");
+  }
+  if (!/^https?:\/\//.test(s.corePublicUrl) || !URL.canParse(s.corePublicUrl)) {
+    throw new Error("CORE_PUBLIC_URL must be Zold's public http(s) origin when Shopify is on: the merchant returns there after an install.");
+  }
+  if (!API_VERSION.test(s.apiVersion)) throw new Error("SHOPIFY_API_VERSION must look like 2026-07.");
+  if (!/^[a-z0-9_,]+$/.test(s.scopes)) throw new Error("SHOPIFY_SCOPES must be comma-separated scope names.");
+  if (!/^[a-z0-9 _-]{1,64}$/.test(s.manualGateway)) throw new Error("SHOPIFY_MANUAL_GATEWAY must be 1 to 64 letters, digits, spaces, - or _.");
+  if (s.shopBaseUrl && !isLoopbackUrl(s.shopBaseUrl)) {
+    throw new Error("SHOPIFY_SHOP_BASE_URL is a test seam and must be a loopback URL.");
+  }
+  if (!cfg.production) return;
+  if (s.shopBaseUrl) throw new Error("SHOPIFY_SHOP_BASE_URL must not be set in production: it points every store at a stub.");
+  if (!s.corePublicUrl.startsWith("https://")) throw new Error("CORE_PUBLIC_URL must be https in production.");
+}
+
 /** Said at startup when nothing will move an AUTHORIZED checkout on; not a refusal, since it was the old behaviour. */
 export function settlementWarning(cfg: Config = CONFIG): string | undefined {
   if (cfg.zoldServiceToken) return undefined;
@@ -265,6 +339,7 @@ export function assertConfigSane(cfg: Config = CONFIG): void {
     );
   }
   assertSettlementSane(cfg);
+  assertShopifySane(cfg);
   // Whatever NODE_ENV says: a staging box would send the token in the clear too.
   if (cfg.zoldServiceToken && !coreIsLoopback(cfg) && !cfg.coreApiUrl.startsWith("https://")) {
     throw new Error("CORE_API_URL must be https (or loopback) when ZOLD_SERVICE_TOKEN is set: it carries the token.");

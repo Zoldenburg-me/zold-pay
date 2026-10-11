@@ -17,6 +17,7 @@ const sign = (id: string, ts: string, body: string, key: Buffer = KEY) =>
   `v1,${createHmac("sha256", key).update(`${id}.${ts}.${body}`).digest("base64")}`;
 
 const seen: string[] = [];
+const hints: string[] = [];
 const logged: string[] = [];
 let clock = NOW_S * 1000;
 let base = "";
@@ -31,6 +32,12 @@ before(async () => {
       onTransfer: (id) => {
         seen.push(id);
       },
+      onPaymentRequest: (linkId, id) => {
+        hints.push(`pr:${linkId}:${id}`);
+      },
+      onLink: (linkId) => {
+        hints.push(`link:${linkId}`);
+      },
       log: (m) => logged.push(String(m)),
     }),
   );
@@ -44,6 +51,7 @@ before(async () => {
 after(() => server.close());
 beforeEach(() => {
   seen.length = 0;
+  hints.length = 0;
 });
 
 let n = 0;
@@ -132,6 +140,27 @@ describe("Zold webhook receiver", () => {
     });
   }
 
+  it("accepts {paymentRequestId, linkId} and {linkId}, and passes each to its own handler", async () => {
+    assert.equal((await deliver({ body: JSON.stringify({ paymentRequestId: "pr1", linkId: "l1" }) })).status, 204);
+    assert.equal((await deliver({ body: JSON.stringify({ linkId: "l2" }) })).status, 204);
+    await flush();
+    assert.deepEqual(hints, ["pr:l1:pr1", "link:l2"]);
+    assert.deepEqual(seen, []);
+  });
+
+  for (const [name, body] of [
+    ["a payment request without its link", JSON.stringify({ paymentRequestId: "pr1" })],
+    ["a transfer and a link at once", JSON.stringify({ transferId: "t1", linkId: "l1" })],
+    ["a link id that is not an id", JSON.stringify({ linkId: "../x" })],
+    ["a state next to the ids", JSON.stringify({ paymentRequestId: "pr1", linkId: "l1", state: "PAID" })],
+  ] as const) {
+    it(`refuses ${name} with 400`, async () => {
+      assert.equal((await deliver({ body })).status, 400);
+      await flush();
+      assert.deepEqual(hints, []);
+    });
+  }
+
   it("refuses a body over 4 KB before checking it", async () => {
     const r = await deliver({ body: JSON.stringify({ transferId: "t1", pad: "x".repeat(5000) }) });
     assert.equal(r.status, 413);
@@ -184,5 +213,30 @@ describe("verifyStandardWebhook", () => {
 
   it("refuses when any input is missing", () => {
     for (const k of ["id", "timestamp", "signature", "secret"]) assert.equal(verifyStandardWebhook(args({ [k]: "" })), false);
+  });
+});
+
+describe("Zold webhook receiver without Shopify", () => {
+  it("acknowledges the Shopify hints and drops them when no handler is given", async () => {
+    const app = express();
+    const got: string[] = [];
+    app.use(createZoldWebhookRouter({ secret: SECRET, now: () => NOW_S * 1000, onTransfer: (id) => got.push(id), log: () => {} }));
+    const s = await new Promise<ReturnType<express.Express["listen"]>>((resolve) => {
+      const srv = app.listen(0, "127.0.0.1", () => resolve(srv));
+    });
+    try {
+      for (const body of [JSON.stringify({ linkId: "l1" }), JSON.stringify({ paymentRequestId: "p", linkId: "l1" })]) {
+        const id = `msg_noshop_${++n}`;
+        const r = await fetch(`http://127.0.0.1:${(s.address() as any).port}/bff/zold/webhook`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "webhook-id": id, "webhook-timestamp": String(NOW_S), "webhook-signature": sign(id, String(NOW_S), body) },
+          body,
+        });
+        assert.equal(r.status, 204);
+      }
+      assert.deepEqual(got, []);
+    } finally {
+      s.close();
+    }
   });
 });

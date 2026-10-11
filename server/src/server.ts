@@ -31,8 +31,11 @@ import {
   statusView,
   transferReference,
 } from "./checkout.js";
-import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled, originIsLoopback, settlementWarning } from "./config.js";
+import { CONFIG, assertConfigSane, coreIsLoopback, devShortcutsEnabled, originIsLoopback, settlementWarning, shopifyTokenKey } from "./config.js";
 import { core, type CoreError } from "./core.js";
+import { createMerchantCore } from "./core-merchant.js";
+import { createShopifyService } from "./shopify.js";
+import { createShopifyAdmin } from "./shopify-admin.js";
 import { createErrorHandler } from "./errors.js";
 import { createRateLimiter } from "./limits.js";
 import { proxy } from "./proxy.js";
@@ -88,6 +91,48 @@ if (settler) {
 } else {
   console.warn(`checkout: ${settlementWarning()}`);
 }
+// The Shopify adapter, when SHOPIFY_API_KEY and SHOPIFY_API_SECRET are set
+// (assertConfigSane has checked everything else it needs). Off: no /shopify route exists.
+const SHOPIFY_SETTLE_BATCH = 50;
+const shopify = CONFIG.shopify.enabled
+  ? createShopifyService(
+      {
+        apiSecret: CONFIG.shopify.apiSecret,
+        manualGateway: CONFIG.shopify.manualGateway,
+        publicOrigin: CONFIG.publicOrigin,
+        corePublicUrl: CONFIG.shopify.corePublicUrl,
+        allowInsecureLoopback: !CONFIG.production,
+        tokenKey: shopifyTokenKey() as Buffer,
+        admin: createShopifyAdmin({
+          apiKey: CONFIG.shopify.apiKey,
+          apiSecret: CONFIG.shopify.apiSecret,
+          scopes: CONFIG.shopify.scopes,
+          apiVersion: CONFIG.shopify.apiVersion,
+          shopBaseUrl: CONFIG.shopify.shopBaseUrl || undefined,
+        }),
+        core: createMerchantCore({ token: CONFIG.zoldServiceToken, allowInsecureLoopback: !CONFIG.production }),
+        log: (...args) => console.error(...args),
+        now: Date.now,
+      },
+      { baseDelayMs: Math.min(30_000, CONFIG.settlePollMs), maxDelayMs: SETTLE_MAX_DELAY_MS, batch: SHOPIFY_SETTLE_BATCH },
+    )
+  : undefined;
+const shopifyTick = () => void shopify?.settler.tick().catch((e) => console.error("shopify settle: tick failed", e));
+let shopifyNudgeTimer: NodeJS.Timeout | undefined;
+const shopifySettleSoon = (linkId: string, paymentRequestId: string) => {
+  if (!shopify?.settler.nudge(linkId, paymentRequestId) || shopifyNudgeTimer) return;
+  shopifyNudgeTimer = setTimeout(() => {
+    shopifyNudgeTimer = undefined;
+    shopifyTick();
+  }, SETTLE_NUDGE_DELAY_MS);
+  shopifyNudgeTimer.unref();
+};
+const shopifyLinkHint = (linkId: string) =>
+  void shopify?.onLinkHint(linkId).catch((e) => console.error("shopify: link hint failed", e));
+if (shopify) {
+  shopifyTick();
+  setInterval(shopifyTick, CONFIG.settlePollMs).unref();
+}
 // Seed a demo merchant only where explicitly asked for and the core is on
 // loopback, so the flow is exercisable without a real partner.
 if (devShortcutsEnabled()) seedDemoMerchant(process.env.CHECKOUT_DEMO_IBAN);
@@ -132,7 +177,22 @@ const frontChannelMerchantLimit = createRateLimiter({
 
 // Zold's state-change hint. Before the JSON parser: its signature is over the raw body.
 if (settler && CONFIG.zoldWebhookSecret) {
-  app.use(createZoldWebhookRouter({ secret: CONFIG.zoldWebhookSecret, onTransfer: settleSoon }));
+  app.use(
+    createZoldWebhookRouter({
+      secret: CONFIG.zoldWebhookSecret,
+      onTransfer: settleSoon,
+      ...(shopify ? { onPaymentRequest: shopifySettleSoon, onLink: shopifyLinkHint } : {}),
+    }),
+  );
+}
+
+// Shopify. Before the JSON parser: the webhook's HMAC is over the raw body. The
+// webhook itself is HMAC-gated and sent from Shopify's addresses, so it gets no
+// per-address limit; the install routes get the credential bucket.
+if (shopify) {
+  app.use(["/shopify/install", "/shopify/callback"], credentialLimit());
+  app.use("/shopify/orders", generalLimit);
+  app.use(shopify.router);
 }
 
 app.use(express.json({ limit: CONFIG.jsonBodyLimit }));
