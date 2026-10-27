@@ -2,6 +2,7 @@
   "name": "pay-with-zold",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "description": "Pay with Zold — hosted merchant checkout for existing Zold users",
   "engines": { "node": ">=22.8" },
