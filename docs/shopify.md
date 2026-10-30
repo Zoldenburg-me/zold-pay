@@ -17,6 +17,8 @@ is "payment pending" in Shopify until the buyer pays.
 
 ## What has never run
 
+Retest status, setup checklist and the agent payment path: `shopify-retest.md`.
+
 - **No Shopify app is registered** for this service. No client id or secret exists.
 - **No store has installed it.** Nothing here has talked to a real Shopify store.
 - **The extension in `shopify-app/` has never been built** with the Shopify CLI
