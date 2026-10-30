@@ -133,6 +133,23 @@ default 50, so 0.5%) also covers bank credits. A €2,000 order paid with
 works this way. Set the tolerance near zero for shop orders before going
 live.
 
+The signature does not cover the order. Monerium's signed message
+(`Send EUR <amt> to <IBAN> at <ts>`) has no memo field, so the request
+code travels unsigned beside it. Whoever submits the signed order could
+swap the code and credit another of the same merchant's orders instead.
+Zold matches any amount, so the payment can part-pay or overpay that order.
+The money still reaches the merchant, but it is booked to the wrong order.
+A code from another merchant does not match, because Zold only looks at the
+requests of the account the credit lands on.
+- **Limit today:** the agent submits its own Monerium order, so no relay
+  holds a signature it could re-memo. This assumes the agent's host is
+  trusted.
+- **To close it:** the contract would take the request code as a decoded
+  field in shape 3 and record it with the reservation. Today shape 3 has no
+  such field. Catching a wrong memo means comparing the Monerium order's
+  memo with the order it was meant for, and that finds it only after the
+  fact.
+
 One check for the contract: Monerium's amount format. Zold writes `42.5`, not
 `42.50` (`moneriumAmountString`), and the contract's canonical form must
 produce the same string.
