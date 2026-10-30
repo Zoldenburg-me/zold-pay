@@ -42,7 +42,11 @@ Creating the accounts and entering credentials is for you to do. Claude does not
    `CHECKOUT_WEBHOOK_URL` and `CHECKOUT_WEBHOOK_SECRET`, plus
    `MERCHANT_LINK_BANK=1` for the agent path. Then issue the checkout
    credential with `POST /api/admin/service-credentials/checkout/rotate`.
-6. **zold-pay `.env`**: `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`,
+6. **zold-pay `.env`**: `CHECKOUT_PUBLIC_ORIGIN` set to the tunnel's https
+   origin. The OAuth callback and the webhook address are built from it, and
+   its default is `http://localhost:3100`. Add the same origin to the test
+   core's `WEBAUTHN_ORIGINS`, never production's, and remove it after the
+   retest. Also set `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`,
    `SHOPIFY_TOKEN_KEY` (`openssl rand -base64 32`), `CORE_PUBLIC_URL`,
    `ZOLD_SERVICE_TOKEN` (the credential from step 5) and
    `ZOLD_WEBHOOK_SECRET`.
